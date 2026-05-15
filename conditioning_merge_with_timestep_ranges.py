@@ -6,9 +6,13 @@ Average). Features:
 
   - merge_mode dropdown: "concat" | "combine" | "average_additive" | "average_normalized"
   - Dynamic 1..N CONDITIONING input slots (driven by web/conditioning_merge_with_timestep_ranges.js).
-  - Each slot has three widgets: start, end, weight.
+  - Each slot has four widgets: start, end, weight, clip_stream_pass.
       - start/end intersect with that input's upstream start_percent/end_percent
         (widget=[0,1] is pass-through; widget can only narrow, never widen).
+      - clip_stream_pass (Pass L+G / Pass L / Pass G): for SDXL conditioning
+        only (last-dim 2048), zeros the non-selected half of each token's
+        embedding so the input contributes to only one of the two CLIP streams.
+        Non-SDXL conditioning passes through unchanged regardless of choice.
       - weight applies per-mode:
           concat              : torch.cat([weight_i * tokens_i for active], dim=1)
           combine             : each emitted entry gets metadata['strength'] = weight_i
@@ -39,7 +43,7 @@ from ._timestep_range_helpers import (
 )
 
 
-CONDITIONING_SLOT_KEY_PATTERN = re.compile(r"^conditioning_(\d+)(_start|_end|_weight)?$")
+CONDITIONING_SLOT_KEY_PATTERN = re.compile(r"^conditioning_(\d+)(_start|_end|_weight|_clip_stream_pass)?$")
 
 MERGE_MODE_CONCAT = "concat"
 MERGE_MODE_COMBINE = "combine"
@@ -52,6 +56,23 @@ MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER = [
     MERGE_MODE_AVERAGE_ADDITIVE,
     MERGE_MODE_AVERAGE_NORMALIZED,
 ]
+
+CLIP_STREAM_PASS_BOTH_L_AND_G = "Pass L+G"
+CLIP_STREAM_PASS_L_ONLY = "Pass L"
+CLIP_STREAM_PASS_G_ONLY = "Pass G"
+
+CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER = [
+    CLIP_STREAM_PASS_BOTH_L_AND_G,
+    CLIP_STREAM_PASS_L_ONLY,
+    CLIP_STREAM_PASS_G_ONLY,
+]
+
+# SDXL token-embedding layout in the CONDITIONING tensor's last dim.
+# Tokens are shape (batch, sequence, embedding_dim) where embedding_dim = 2048
+# for SDXL = 768 (CLIP-L) + 1280 (CLIP-G), concatenated along the last axis.
+SDXL_EMBEDDING_TOTAL_DIM = 2048
+SDXL_CLIP_L_PORTION_DIM = 768
+SDXL_CLIP_G_PORTION_DIM = 1280
 
 
 class FlexibleOptionalConditioningSlotInputType(dict):
@@ -84,6 +105,8 @@ class FlexibleOptionalConditioningSlotInputType(dict):
                     return ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001})
                 if suffix == "_weight":
                     return ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01})
+                if suffix == "_clip_stream_pass":
+                    return (CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER, {"default": CLIP_STREAM_PASS_BOTH_L_AND_G})
         return ("*",)
 
 
@@ -104,7 +127,7 @@ def _zero_pad_or_truncate_tokens_to_match_reference_token_count(
 
 
 def _parse_kwargs_into_per_slot_dict(kwargs):
-    """Returns {slot_index: {'conditioning': list_or_None, 'start': float, 'end': float, 'weight': float}}."""
+    """Returns {slot_index: {'conditioning': list_or_None, 'start': float, 'end': float, 'weight': float, 'clip_stream_pass': str}}."""
     per_slot_dict = {}
     for key, value in kwargs.items():
         match = CONDITIONING_SLOT_KEY_PATTERN.match(key)
@@ -113,7 +136,13 @@ def _parse_kwargs_into_per_slot_dict(kwargs):
         slot_index = int(match.group(1))
         suffix = match.group(2)
         if slot_index not in per_slot_dict:
-            per_slot_dict[slot_index] = {"conditioning": None, "start": 0.0, "end": 1.0, "weight": 1.0}
+            per_slot_dict[slot_index] = {
+                "conditioning": None,
+                "start": 0.0,
+                "end": 1.0,
+                "weight": 1.0,
+                "clip_stream_pass": CLIP_STREAM_PASS_BOTH_L_AND_G,
+            }
         if suffix is None:
             per_slot_dict[slot_index]["conditioning"] = value
         elif suffix == "_start":
@@ -122,7 +151,43 @@ def _parse_kwargs_into_per_slot_dict(kwargs):
             per_slot_dict[slot_index]["end"] = float(value)
         elif suffix == "_weight":
             per_slot_dict[slot_index]["weight"] = float(value)
+        elif suffix == "_clip_stream_pass":
+            per_slot_dict[slot_index]["clip_stream_pass"] = str(value)
     return per_slot_dict
+
+
+def _apply_clip_stream_pass_mask_to_tokens_and_pooled(
+    tokens_tensor, metadata_dict, clip_stream_pass_choice
+):
+    """
+    Returns (masked_tokens_tensor, masked_metadata_dict) per the chosen
+    clip_stream_pass setting. Only acts on SDXL-shaped tensors (last dim ==
+    2048). For other shapes the input is returned unchanged.
+
+    The 2048-dim last axis is the concatenation of CLIP-L (768) and
+    CLIP-G (1280). pooled_output (1280-dim) comes from CLIP-G only.
+    """
+    if clip_stream_pass_choice == CLIP_STREAM_PASS_BOTH_L_AND_G:
+        return tokens_tensor, metadata_dict
+
+    last_axis_size = tokens_tensor.shape[-1] if tokens_tensor is not None else 0
+    if last_axis_size != SDXL_EMBEDDING_TOTAL_DIM:
+        # Non-SDXL shape — masking the layout would be nonsense; passthrough.
+        return tokens_tensor, metadata_dict
+
+    masked_tokens_tensor = tokens_tensor.clone()
+    masked_metadata_dict = metadata_dict.copy()
+
+    if clip_stream_pass_choice == CLIP_STREAM_PASS_L_ONLY:
+        masked_tokens_tensor[:, :, SDXL_CLIP_L_PORTION_DIM:] = 0.0
+        # pooled_output is CLIP-G only; suppress it when only L should pass.
+        if "pooled_output" in masked_metadata_dict and masked_metadata_dict["pooled_output"] is not None:
+            masked_metadata_dict["pooled_output"] = torch.zeros_like(masked_metadata_dict["pooled_output"])
+    elif clip_stream_pass_choice == CLIP_STREAM_PASS_G_ONLY:
+        masked_tokens_tensor[:, :, :SDXL_CLIP_L_PORTION_DIM] = 0.0
+        # pooled_output stays as-is (G-only, which we want).
+
+    return masked_tokens_tensor, masked_metadata_dict
 
 
 def _flatten_connected_slots_into_per_entry_input_records(per_slot_dict):
@@ -145,9 +210,16 @@ def _flatten_connected_slots_into_per_entry_input_records(per_slot_dict):
         widget_start = slot_data["start"]
         widget_end = slot_data["end"]
         weight = slot_data["weight"]
+        clip_stream_pass_choice = slot_data["clip_stream_pass"]
         for entry_index_within_slot, conditioning_entry in enumerate(conditioning_list):
-            entry_tokens_tensor = conditioning_entry[0]
-            entry_metadata_dict = conditioning_entry[1]
+            raw_entry_tokens_tensor = conditioning_entry[0]
+            raw_entry_metadata_dict = conditioning_entry[1]
+            # Apply per-slot CLIP-stream masking BEFORE segmentation so the
+            # masked tokens/pooled feed downstream identically to any other
+            # input.
+            entry_tokens_tensor, entry_metadata_dict = _apply_clip_stream_pass_mask_to_tokens_and_pooled(
+                raw_entry_tokens_tensor, raw_entry_metadata_dict, clip_stream_pass_choice
+            )
             effective_start, effective_end = compute_effective_range_from_widget_and_upstream(
                 widget_start, widget_end, entry_metadata_dict
             )

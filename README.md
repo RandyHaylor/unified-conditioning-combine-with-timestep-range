@@ -41,6 +41,12 @@ category.
 - **conditioning_N_weight** (FLOAT 0..10, default 1.0) — per-input weight.
   Meaning depends on mode (see below). Default `1.0` reproduces stock
   behavior in every mode.
+- **conditioning_N_clip_stream_pass** (dropdown: `Pass L+G` / `Pass L` /
+  `Pass G`, default `Pass L+G`) — SDXL-only. Lets you route this input's
+  prompt to only one of SDXL's two CLIP streams by zeroing the other half
+  of each token's embedding. `Pass L` also zeros `pooled_output` since
+  pooled is CLIP-G only. Non-SDXL conditioning (last embedding dim != 2048)
+  ignores this setting and passes through unchanged.
 
 ---
 

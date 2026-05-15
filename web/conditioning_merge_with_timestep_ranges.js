@@ -91,7 +91,12 @@ function addOneSlotHeaderLabelWidget(node, slot_number_to_use) {
   return slot_header_label_widget;
 }
 
+const CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER = ["Pass L+G", "Pass L", "Pass G"];
+const CLIP_STREAM_PASS_DEFAULT_VALUE = "Pass L+G";
+
 function addOneWidgetTripleForSlot(node, slot_number_to_use) {
+  // Despite the historical "Triple" name, this now adds FOUR widgets per slot:
+  // start, end, weight, and clip_stream_pass.
   node.addWidget(
     "number",
     `conditioning_${slot_number_to_use}_start`,
@@ -112,6 +117,13 @@ function addOneWidgetTripleForSlot(node, slot_number_to_use) {
     1.0,
     () => {},
     { min: 0.0, max: 10.0, step: 0.01, precision: 2 },
+  );
+  node.addWidget(
+    "combo",
+    `conditioning_${slot_number_to_use}_clip_stream_pass`,
+    CLIP_STREAM_PASS_DEFAULT_VALUE,
+    () => {},
+    { values: CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER },
   );
 }
 
@@ -152,7 +164,7 @@ function rebuildWidgetsArrayMatchingCurrentlyConnectedSlotsOnNode(node) {
     addOneSlotHeaderLabelWidget(node, slot_number);
     addOneWidgetTripleForSlot(node, slot_number);
     // Restore captured values where available.
-    for (const suffix of ["_start", "_end", "_weight"]) {
+    for (const suffix of ["_start", "_end", "_weight", "_clip_stream_pass"]) {
       const widget_name = `conditioning_${slot_number}${suffix}`;
       if (captured_widget_values_by_name[widget_name] !== undefined) {
         const widget_index = node.widgets.findIndex((w) => w && w.name === widget_name);
@@ -182,7 +194,7 @@ function renumberRemainingConditioningSlotsContiguouslyStartingAtOne(node) {
     if (current_slot_number !== next_desired_slot_number) {
       input_descriptor.name = `conditioning_${next_desired_slot_number}`;
       // Rename widgets.
-      for (const suffix of ["_start", "_end", "_weight"]) {
+      for (const suffix of ["_start", "_end", "_weight", "_clip_stream_pass"]) {
         const old_widget_name = `conditioning_${current_slot_number}${suffix}`;
         const new_widget_name = `conditioning_${next_desired_slot_number}${suffix}`;
         const widget_index = (node.widgets || []).findIndex((w) => w && w.name === old_widget_name);
