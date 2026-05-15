@@ -273,13 +273,14 @@ def _merge_in_segmented_mode(per_entry_input_records, merge_mode):
 class ConditioningMergeWithTimestepRanges:
     @classmethod
     def INPUT_TYPES(cls):
+        # Slot 1's start/end/weight widgets are NOT in `required` — the JS
+        # extension creates them dynamically only when slot 1 is connected,
+        # so that an empty slot 1 shows no widgets (consistent with how empty
+        # slots 2+ behave).
         return {
             "required": {
                 "merge_mode": (MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER, {"default": MERGE_MODE_CONCAT}),
                 "conditioning_1": ("CONDITIONING",),
-                "conditioning_1_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "conditioning_1_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "conditioning_1_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
             },
             "optional": FlexibleOptionalConditioningSlotInputType(),
         }

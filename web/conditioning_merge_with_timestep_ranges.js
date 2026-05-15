@@ -1,24 +1,25 @@
 // Dynamic-slot frontend extension for ConditioningMergeWithTimestepRanges.
 //
 // Behavior:
-//   - Each conditioning input slot has three widgets (start, end, weight) and
-//     a small canvas-drawn header label "── slot N ──" above its triple to
-//     visually group them with the corresponding input.
-//   - The slot list auto-expands and auto-collapses on connection changes:
-//       * Connecting the trailing empty slot adds a new trailing empty slot.
-//       * Disconnecting any slot (whether trailing or middle) removes that
-//         slot plus its widget triple plus its header. Exactly one trailing
-//         empty slot is always maintained.
+//   - Each CONNECTED conditioning_<N> slot gets a small header label
+//     "── slot N ──" plus three widgets (start, end, weight).
+//   - An empty / unconnected slot has NO header and NO widgets — it's just
+//     an input pin waiting for a connection. Exactly one trailing empty slot
+//     is always maintained.
+//   - Connecting the trailing empty slot causes its widgets to appear and a
+//     new (empty, widgetless) trailing slot to be added.
+//   - Disconnecting any slot removes that slot (auto-collapse). Its widget
+//     values are not preserved across the disconnect — reconnecting starts
+//     at defaults.
 //   - Widget values persist across save/load:
 //       * `serialize_widgets = true` is set on the node.
-//       * `configure(info)` is overridden to rebuild widget triples (and
-//         their non-serializing headers) matching the restored slot count
-//         BEFORE LiteGraph populates widget values from info.widgets_values
-//         positionally (reference: rgthree power_lora_loader.js:21,51-70).
+//       * `configure(info)` is overridden to rebuild widget triples for every
+//         CONNECTED slot before LiteGraph positionally restores widget
+//         values from info.widgets_values.
 //
 // Depends only on ComfyUI core (`../../scripts/app.js`) and LiteGraph core
-// methods (addInput / removeInput / addWidget / setDirtyCanvas, plus the
-// inputs[] / widgets[] arrays). No third-party imports.
+// methods (addInput / removeInput / setDirtyCanvas, plus the inputs[] /
+// widgets[] arrays). No third-party imports.
 
 import { app } from "../../scripts/app.js";
 
@@ -56,12 +57,11 @@ function indexOfTrailingEmptyConditioningSlotInInputsArrayOrMinusOne(node) {
   return last_index_in_inputs_array;
 }
 
-// -------------- widget add / remove --------------
+// -------------- widget add helpers --------------
 
 function addOneSlotHeaderLabelWidget(node, slot_number_to_use) {
-  // Non-serializing label widget that visually groups the slot's triple
-  // with its input slot. `options.serialize = false` keeps it out of
-  // widgets_values so positional widget restoration on load stays aligned.
+  // Non-serializing label widget. options.serialize=false keeps it out of
+  // widgets_values so positional widget restoration stays aligned.
   const slot_header_label_widget = {
     name: `__header_for_slot_${slot_number_to_use}`,
     type: "custom",
@@ -111,12 +111,6 @@ function addOneWidgetTripleForSlot(node, slot_number_to_use) {
   );
 }
 
-function addOneConditioningInputSlotAndItsWidgetTripleAndHeader(node, slot_number_to_use) {
-  node.addInput(`conditioning_${slot_number_to_use}`, "CONDITIONING");
-  addOneSlotHeaderLabelWidget(node, slot_number_to_use);
-  addOneWidgetTripleForSlot(node, slot_number_to_use);
-}
-
 function removeWidgetsByNameOnNode(node, list_of_widget_names_to_remove) {
   if (!node.widgets) return;
   for (const widget_name_to_find of list_of_widget_names_to_remove) {
@@ -129,49 +123,31 @@ function removeWidgetsByNameOnNode(node, list_of_widget_names_to_remove) {
   }
 }
 
-function removeConditioningSlotAtInputsArrayIndexAndItsHeaderAndTriple(node, slot_index_in_inputs_array) {
-  if (!node.inputs || slot_index_in_inputs_array < 0 || slot_index_in_inputs_array >= node.inputs.length) return;
-  const input_descriptor = node.inputs[slot_index_in_inputs_array];
-  const match = input_descriptor && input_descriptor.name
-    ? input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX)
-    : null;
-  if (!match) return;
-  const slot_number_string = match[1];
+// -------------- widget array rebuild: ONE widget set per CONNECTED slot --------------
 
-  node.removeInput(slot_index_in_inputs_array);
-
-  removeWidgetsByNameOnNode(node, [
-    `conditioning_${slot_number_string}_weight`,
-    `conditioning_${slot_number_string}_end`,
-    `conditioning_${slot_number_string}_start`,
-    `__header_for_slot_${slot_number_string}`,
-  ]);
-}
-
-// -------------- widget array layout normalize --------------
-
-function rebuildWidgetsArrayWithHeadersInFrontOfEachSlotTripleOnNode(node) {
-  // Preserve current values so the rebuild doesn't reset user-edited fields.
+function rebuildWidgetsArrayMatchingCurrentlyConnectedSlotsOnNode(node) {
+  // Preserve current widget values so a rebuild doesn't reset user-edited
+  // fields for slots that are still connected.
   const captured_widget_values_by_name = {};
   for (const widget_descriptor of node.widgets || []) {
     if (widget_descriptor && widget_descriptor.name && widget_descriptor.value !== undefined) {
       captured_widget_values_by_name[widget_descriptor.name] = widget_descriptor.value;
     }
   }
-  // Wipe everything past the merge_mode widget at index 0.
+  // Strip everything past the merge_mode widget at index 0.
   while (node.widgets && node.widgets.length > 1) {
     node.widgets.pop();
   }
-  // Re-add header + triple for each conditioning_<N> input slot, restoring
-  // captured values where we had them.
+  // Re-add header + triple ONLY for connected conditioning slots.
   for (const input_descriptor of node.inputs || []) {
-    const match = input_descriptor && input_descriptor.name
-      ? input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX)
-      : null;
+    if (!input_descriptor || !input_descriptor.name) continue;
+    const match = input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX);
     if (!match) continue;
+    if (input_descriptor.link == null) continue; // skip empties
     const slot_number = parseInt(match[1], 10);
     addOneSlotHeaderLabelWidget(node, slot_number);
     addOneWidgetTripleForSlot(node, slot_number);
+    // Restore captured values where available.
     for (const suffix of ["_start", "_end", "_weight"]) {
       const widget_name = `conditioning_${slot_number}${suffix}`;
       if (captured_widget_values_by_name[widget_name] !== undefined) {
@@ -189,25 +165,25 @@ function rebuildWidgetsArrayWithHeadersInFrontOfEachSlotTripleOnNode(node) {
 function stabilizeDynamicSlotsOnConditioningMergeNode(node) {
   if (!node.inputs) return;
 
-  // Step 1: remove EVERY unconnected conditioning slot. This collapses middle
-  // gaps AND removes the previous trailing empty. (We'll re-add a single
-  // trailing empty at the end in step 2.)
-  // Walk from the end so removeInput index math stays valid.
+  // Step 1: remove EVERY unconnected conditioning slot (collapses middle
+  // gaps and the previous trailing empty). Walk from end so removeInput
+  // index math stays valid.
   for (let slot_index_in_inputs_array = node.inputs.length - 1; slot_index_in_inputs_array >= 0; slot_index_in_inputs_array--) {
     const input_descriptor = node.inputs[slot_index_in_inputs_array];
     if (!input_descriptor || !input_descriptor.name) continue;
     if (!CONDITIONING_INPUT_NAME_REGEX.test(input_descriptor.name)) continue;
-    if (input_descriptor.link != null) continue; // connected — keep
-    removeConditioningSlotAtInputsArrayIndexAndItsHeaderAndTriple(node, slot_index_in_inputs_array);
+    if (input_descriptor.link != null) continue;
+    node.removeInput(slot_index_in_inputs_array);
   }
 
-  // Step 2: ensure exactly one trailing empty conditioning slot exists, with
-  // a slot number one greater than the highest remaining (or 1 if none).
-  const trailing_empty_index_after_collapse = indexOfTrailingEmptyConditioningSlotInInputsArrayOrMinusOne(node);
-  if (trailing_empty_index_after_collapse < 0) {
-    const next_slot_number = findHighestConditioningSlotIndexFromExistingInputs(node) + 1;
-    addOneConditioningInputSlotAndItsWidgetTripleAndHeader(node, next_slot_number);
-  }
+  // Step 2: rebuild widgets so only currently-connected slots have a
+  // header + triple. This also picks up newly-connected slots that didn't
+  // have widgets before.
+  rebuildWidgetsArrayMatchingCurrentlyConnectedSlotsOnNode(node);
+
+  // Step 3: add a trailing empty input slot WITHOUT widgets.
+  const next_slot_number = findHighestConditioningSlotIndexFromExistingInputs(node) + 1;
+  node.addInput(`conditioning_${next_slot_number}`, "CONDITIONING");
 
   node.setDirtyCanvas(true, true);
 }
@@ -236,29 +212,26 @@ app.registerExtension({
       const original_result = original_on_node_created_function
         ? original_on_node_created_function.apply(this, arguments)
         : undefined;
-      // ComfyUI's auto-build creates widgets for INPUT_TYPES.required
-      // (merge_mode + slot 1 triple) without our header. Rebuild the widget
-      // array so every slot's triple has its header above it.
-      rebuildWidgetsArrayWithHeadersInFrontOfEachSlotTripleOnNode(this);
       scheduleStabilizationOnNode(this);
       return original_result;
     };
 
     const original_configure_function = nodeType.prototype.configure;
     nodeType.prototype.configure = function (serialized_node_data_object) {
-      // Strip widgets past merge_mode and rebuild the right number of
-      // headers + triples BEFORE delegating to original configure (which
-      // positionally restores widgets_values).
-      const restored_conditioning_slot_count_from_saved_inputs = (serialized_node_data_object && serialized_node_data_object.inputs || [])
-        .filter((input_descriptor) =>
-          input_descriptor && input_descriptor.name && CONDITIONING_INPUT_NAME_REGEX.test(input_descriptor.name)
-        )
-        .length;
+      // Strip widgets past merge_mode, then add a header + triple for every
+      // CONNECTED conditioning slot in the saved input list. Empty slots
+      // (including the trailing empty) get no widgets.
+      const saved_inputs_list = (serialized_node_data_object && serialized_node_data_object.inputs) || [];
 
       while (this.widgets && this.widgets.length > 1) {
         this.widgets.pop();
       }
-      for (let slot_number_being_rebuilt = 1; slot_number_being_rebuilt <= restored_conditioning_slot_count_from_saved_inputs; slot_number_being_rebuilt++) {
+      for (const input_descriptor of saved_inputs_list) {
+        if (!input_descriptor || !input_descriptor.name) continue;
+        const match = input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX);
+        if (!match) continue;
+        if (input_descriptor.link == null) continue;
+        const slot_number_being_rebuilt = parseInt(match[1], 10);
         addOneSlotHeaderLabelWidget(this, slot_number_being_rebuilt);
         addOneWidgetTripleForSlot(this, slot_number_being_rebuilt);
       }
