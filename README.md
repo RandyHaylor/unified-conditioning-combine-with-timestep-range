@@ -186,40 +186,64 @@ Useful for verifying that `start_percent` / `end_percent` / `pooled_output` /
 
 ## CLIPTextEncodeSDXL (auto-split-and-merge)
 
-A drop-in extension of stock `CLIPTextEncodeSDXL`. When a prompt is longer
-than 77 tokens, the CLIP tokenizer splits it into multiple chunks. This node
-adds two dropdowns controlling what happens with those chunks per stream:
+A drop-in extension of stock `CLIPTextEncodeSDXL` with smart pre-tokenize
+splitting AND two dropdowns controlling what to do with the resulting
+chunks per stream:
 
 - **split_and_merge_g** (CLIP-G stream): `truncate` / `combine` / `average`
 - **split_and_merge_l** (CLIP-L stream): `truncate` / `combine` / `average`
 
-Modes:
-- `truncate` (default) — keep only the first 77-token chunk for that stream.
-  Both streams at `truncate` reproduces stock `CLIPTextEncodeSDXL` behavior
-  (modulo the difference that stock concatenates chunks along seq dim,
-  whereas truncate here actually drops overflow).
-- `combine` — keep all chunks; each becomes a separate CONDITIONING entry
-  (parallel branches the sampler handles independently).
-- `average` — encode each chunk separately, then blend token tensors and
-  pooled outputs into a single CONDITIONING entry.
+### How the splitting works
 
-The two dropdowns are independent. Output reduction:
+The node does its own text splitting BEFORE tokenization to avoid the
+"tiny last chunk" problem (a 4-token tail gets way over-weighted in average
+mode and looks goofy in combine mode). Split marker priority, highest first:
+
+1. **`BREAK`** — uppercase whole word, same convention as A1111 / Forge.
+   Hard boundary — sub-balancing never crosses it.
+2. **comma** `,`
+3. **line break** `\n`
+4. **any whitespace**
+5. **character force-split** (last resort)
+
+For each `BREAK`-separated segment, the node counts its content tokens and
+computes `K = ceil(tokens / 75)`, the number of 75-token sub-chunks that
+segment needs. If `K == 1` the segment is used as-is. If `K > 1` it sub-
+splits at the highest-priority delimiter where every resulting piece fits,
+then greedy-bin-packs the pieces into K bins targeting equal token counts.
+Result: chunks are roughly the same size — no tiny over-weighted tail.
+
+### Per-mode behavior (post-splitting)
+
+- `truncate` (default) — keep only the FIRST balanced text piece.
+- `combine` — each piece becomes a separate CONDITIONING entry (parallel
+  branches the sampler handles independently).
+- `average` — encode each piece, then blend the resulting token tensors
+  and pooled outputs into a single CONDITIONING entry.
+
+### Output reduction
+
+The two dropdowns are independent. Final output multiplicity:
 - If either stream is `combine` → multi-entry CONDITIONING.
 - Else if either is `average` → single-entry averaged CONDITIONING.
 - Else (both `truncate`) → single-entry truncated CONDITIONING.
 
-Both streams are encoded in paired chunks; if one stream has fewer chunks
-than the other, the shorter one is padded with empty-text chunks per the
-same padding logic stock `CLIPTextEncodeSDXL` uses.
+Both streams encode in paired pieces; if one stream's split produces fewer
+pieces than the other, the shorter side is padded with empty text per stock
+`CLIPTextEncodeSDXL`'s shorter-side-pad logic.
 
-Inputs and size-conditioning fields (`width`, `height`, `crop_w/h`,
-`target_width/height`) are identical to stock.
+### Inputs
 
-Outputs:
+Same size-conditioning fields as stock SDXL encoder (`width`, `height`,
+`crop_w/h`, `target_width/height`), plus `text_g`, `text_l`, and the two
+dropdowns above.
+
+### Outputs
+
 - `conditioning` (CONDITIONING)
-- `debug_info` (STRING) — names chunk counts, modes, paired-encode count,
-  and reduction strategy. Wire into a ShowText node to see at a glance how
-  the merge happened.
+- `debug_info` (STRING) — names balanced-piece counts per stream, the modes,
+  per-pair token counts, and the chosen reduction strategy. Wire into a
+  ShowText node to see exactly how splitting happened.
 
 ---
 

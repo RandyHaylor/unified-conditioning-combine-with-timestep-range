@@ -2,39 +2,52 @@
 CLIPTextEncodeSDXL (auto-split-and-merge)
 
 Drop-in extension of stock CLIPTextEncodeSDXL with two dropdowns that control
-what happens when a prompt is long enough that the CLIP tokenizer splits it
-into more than one 77-token chunk:
+what happens when a prompt exceeds 77 tokens AND with smart pre-tokenize
+splitting at BREAK / comma / line / space boundaries so chunk sizes stay
+balanced (no tiny over-weighted tail chunks).
 
     split_and_merge_g   ∈ {truncate, combine, average}     (CLIP-G stream)
     split_and_merge_l   ∈ {truncate, combine, average}     (CLIP-L stream)
 
-Per-mode behavior:
-    truncate   — keep only the FIRST 77-token chunk of that stream
-                 (any overflow tokens are dropped; default, matches
-                 most users' implicit expectation of stock encoders).
-    combine    — keep ALL chunks of that stream as separate parallel
-                 branches in the output CONDITIONING list.
-    average    — keep all chunks, encode each, then blend their
-                 resulting embeddings (and pooled_output) into a
-                 single 77-token cond entry.
+Split markers, highest priority first:
+    BREAK         — capitalized whole word; same convention as A1111/Forge.
+                    Acts as a HARD boundary — sub-balancing never crosses it.
+    comma         — `,`
+    line break    — `\\n`
+    whitespace    — falls back to any whitespace
+    character     — last-resort hard split (preserves nothing; should be rare).
 
-The two dropdowns are independent. The final output count depends on the
+Balancing strategy (when one BREAK-segment exceeds 75 content tokens):
+    Compute K = ceil(segment_tokens / 75). Sub-split the segment at the
+    highest-priority delimiter whose pieces each fit, then greedy-bin-pack
+    pieces into K bins targeting an even per-bin token count. Worst-case
+    fallback: equal character-length slicing.
+
+Per-mode behavior after splitting:
+    truncate   — keep only the FIRST text piece of that stream.
+    combine    — keep ALL pieces; each becomes a separate CONDITIONING entry
+                 (parallel branches).
+    average    — keep all pieces, encode each, then blend the resulting
+                 embeddings into a single CONDITIONING entry.
+
+The two dropdowns are independent. Final output count depends on the
 COMBINATION:
-    - If either stream is `combine`  → multi-entry output (one per chunk pair).
-    - Else if either stream is `average` → single-entry output (averaged).
-    - Else (both truncate)             → single-entry output (one chunk).
+    - If either stream is `combine`  → multi-entry output.
+    - Else if either is `average`    → single-entry averaged output.
+    - Else (both truncate)           → single-entry output (one chunk).
 
-Output:
+Outputs:
     conditioning  (CONDITIONING) — usable in any sampler; multi-entry when
                                    `combine` is selected on either stream.
-    debug_info    (STRING)       — description of how many chunks each
-                                   stream had and how the result was built.
+    debug_info    (STRING)       — description of how splitting and merging
+                                   happened, including piece counts per
+                                   stream and per-piece token counts.
 
-Stock CLIPTextEncodeSDXL behavior is reproduced when both dropdowns are
-left at `truncate`.
-
-Source reference: ComfyUI/comfy_extras/nodes_clip_sdxl.py:28 (CLIPTextEncodeSDXL).
+Reference: comfy_extras/nodes_clip_sdxl.py:28 (stock CLIPTextEncodeSDXL).
 """
+
+import math
+import re
 
 import torch
 
@@ -51,30 +64,266 @@ SPLIT_AND_MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER = [
     SPLIT_AND_MERGE_MODE_AVERAGE,
 ]
 
+# Each CLIP-77-token chunk has start + end + content + padding. Real content
+# tokens per chunk: 77 - 2 (start/end) = 75.
+CLIP_TOKENS_PER_CHUNK_INCLUDING_MARKERS = 77
+CLIP_CONTENT_TOKENS_PER_CHUNK_EXCLUDING_MARKERS = 75
 
-def _reduce_chunks_list_to_a_single_first_chunk_when_truncating(
-    tokenizer_chunks_list, split_and_merge_mode
+# BREAK is matched as the standalone uppercase word, not as a substring of
+# something else. \b would also match e.g. "BREAKDOWN" so use no-non-space
+# lookarounds.
+BREAK_MARKER_REGEX_PATTERN = re.compile(r"(?:(?<=\s)|(?<=^))BREAK(?=\s|$)")
+
+# Delimiter cascade for sub-splitting a BREAK segment that's still too long.
+# Each tuple is (split_regex_pattern, rejoin_string).
+DELIMITER_CASCADE_FOR_SUBSPLITTING_OVERLONG_SEGMENTS = [
+    (re.compile(r"\s*,\s*"), ", "),     # comma
+    (re.compile(r"\s*\n\s*"), "\n"),   # line break
+    (re.compile(r"\s+"), " "),          # any whitespace
+]
+
+
+# -------------- token-counting helpers --------------
+
+def _identify_special_token_ids_from_empty_text_tokenization(clip, stream_key):
+    """
+    Returns (start_token_id, end_token_id, pad_token_id) by tokenizing the
+    empty string and inspecting the first chunk's structure.
+
+    Stock SD1ClipModel emits each chunk as
+        [(start, w), <content>, (end, w), (pad, w), ...]
+    so the first three IDs from an empty-text chunk give us the markers.
+    """
+    empty_tokenization_chunks_per_stream = clip.tokenize("")
+    if stream_key not in empty_tokenization_chunks_per_stream:
+        return (None, None, None)
+    first_empty_chunk = empty_tokenization_chunks_per_stream[stream_key][0]
+    if len(first_empty_chunk) < 3:
+        return (None, None, None)
+    start_token_id_value = first_empty_chunk[0][0]
+    # In an empty chunk, the very next token is end-of-text (since content is
+    # empty). After end, all remaining slots are padding.
+    end_token_id_value = first_empty_chunk[1][0]
+    pad_token_id_value = first_empty_chunk[-1][0]
+    return (start_token_id_value, end_token_id_value, pad_token_id_value)
+
+
+def _count_content_tokens_in_text_using_clip_tokenizer(text, clip, stream_key):
+    """
+    Returns the number of CONTENT tokens (excluding start/end/pad) that the
+    CLIP tokenizer would produce for `text` on the given stream.
+
+    Used by the balancing algorithm to evaluate how to partition a long
+    segment into roughly-equal-sized sub-pieces.
+    """
+    if not text or not text.strip():
+        return 0
+    full_tokenization_chunks_per_stream = clip.tokenize(text)
+    if stream_key not in full_tokenization_chunks_per_stream:
+        return 0
+    chunks_list_for_stream = full_tokenization_chunks_per_stream[stream_key]
+    if not chunks_list_for_stream:
+        return 0
+
+    start_token_id, end_token_id, pad_token_id = _identify_special_token_ids_from_empty_text_tokenization(
+        clip, stream_key
+    )
+
+    total_full_chunks_before_last_chunk = max(0, len(chunks_list_for_stream) - 1)
+    content_tokens_from_full_chunks = (
+        total_full_chunks_before_last_chunk * CLIP_CONTENT_TOKENS_PER_CHUNK_EXCLUDING_MARKERS
+    )
+
+    last_chunk_in_stream = chunks_list_for_stream[-1]
+    last_chunk_content_token_count = 0
+    for token_id_in_pair, _weight_in_pair in last_chunk_in_stream:
+        if pad_token_id is not None and token_id_in_pair == pad_token_id:
+            break
+        if start_token_id is not None and token_id_in_pair == start_token_id:
+            continue
+        if end_token_id is not None and token_id_in_pair == end_token_id:
+            continue
+        last_chunk_content_token_count += 1
+
+    return content_tokens_from_full_chunks + last_chunk_content_token_count
+
+
+# -------------- text splitting helpers --------------
+
+def _split_text_at_break_markers_into_hard_segments(text):
+    """
+    Splits at the BREAK marker (whole word, surrounded by whitespace or
+    string-edge). Returns a list of segments — never crosses a BREAK during
+    later balancing.
+    """
+    if not text:
+        return [""]
+    raw_segments_from_break_split = BREAK_MARKER_REGEX_PATTERN.split(text)
+    cleaned_segments_after_stripping_whitespace = [seg.strip() for seg in raw_segments_from_break_split]
+    return cleaned_segments_after_stripping_whitespace
+
+
+def _force_character_split_text_into_n_roughly_equal_substring_pieces(text, target_piece_count):
+    """Last-resort even-length character slicing when no delimiter works."""
+    if target_piece_count <= 1:
+        return [text]
+    average_piece_length_in_characters = max(1, len(text) // target_piece_count)
+    output_pieces_after_character_slicing = []
+    for piece_index in range(target_piece_count):
+        slice_start_character_index = piece_index * average_piece_length_in_characters
+        if piece_index == target_piece_count - 1:
+            slice_end_character_index = len(text)
+        else:
+            slice_end_character_index = (piece_index + 1) * average_piece_length_in_characters
+        output_pieces_after_character_slicing.append(text[slice_start_character_index:slice_end_character_index])
+    return output_pieces_after_character_slicing
+
+
+def _greedy_bin_pack_pieces_into_k_bins_targeting_equal_token_count(
+    pieces_list, piece_token_counts_list, target_bin_count
 ):
-    if split_and_merge_mode == SPLIT_AND_MERGE_MODE_TRUNCATE and len(tokenizer_chunks_list) > 0:
-        return tokenizer_chunks_list[:1]
-    return list(tokenizer_chunks_list)
+    """
+    Distributes `pieces_list` into `target_bin_count` bins as
+    a list-of-lists, advancing to the next bin once the current bin's
+    accumulated token count reaches (total / target_bin_count). Greedy and
+    cheap; not optimal but close enough for our needs.
+    """
+    total_tokens_across_all_pieces = sum(piece_token_counts_list)
+    target_tokens_per_bin = (
+        total_tokens_across_all_pieces / float(target_bin_count) if target_bin_count > 0 else 0.0
+    )
+    bins_of_pieces = [[] for _ in range(target_bin_count)]
+    bin_running_token_counts = [0] * target_bin_count
+    current_bin_index_for_packing = 0
+    for piece_text, piece_token_count in zip(pieces_list, piece_token_counts_list):
+        bins_of_pieces[current_bin_index_for_packing].append(piece_text)
+        bin_running_token_counts[current_bin_index_for_packing] += piece_token_count
+        if (
+            bin_running_token_counts[current_bin_index_for_packing] >= target_tokens_per_bin
+            and current_bin_index_for_packing < target_bin_count - 1
+        ):
+            current_bin_index_for_packing += 1
+    return bins_of_pieces
 
 
-def _pad_two_chunk_lists_to_matching_length_with_empty_chunks(
-    chunks_list_for_g_stream, chunks_list_for_l_stream, clip
+def _try_to_balance_split_a_single_segment_into_k_pieces_via_delimiter_cascade(
+    segment_text, target_piece_count, clip, stream_key
 ):
-    target_chunk_count = max(len(chunks_list_for_g_stream), len(chunks_list_for_l_stream))
+    """
+    Attempts each delimiter in DELIMITER_CASCADE_FOR_SUBSPLITTING and returns
+    the first balanced K-piece split where every resulting piece fits within
+    CLIP_CONTENT_TOKENS_PER_CHUNK. Falls back to character slicing if no
+    delimiter level produces a successful split.
+    """
+    if target_piece_count <= 1:
+        return [segment_text]
+
+    for delimiter_split_regex, delimiter_rejoin_string in DELIMITER_CASCADE_FOR_SUBSPLITTING_OVERLONG_SEGMENTS:
+        candidate_pieces_after_split = [
+            piece.strip()
+            for piece in delimiter_split_regex.split(segment_text)
+            if piece.strip()
+        ]
+        if len(candidate_pieces_after_split) < target_piece_count:
+            continue
+
+        per_piece_token_counts = [
+            _count_content_tokens_in_text_using_clip_tokenizer(piece, clip, stream_key)
+            for piece in candidate_pieces_after_split
+        ]
+        bins_of_pieces_after_packing = _greedy_bin_pack_pieces_into_k_bins_targeting_equal_token_count(
+            candidate_pieces_after_split, per_piece_token_counts, target_piece_count
+        )
+
+        rejoined_bin_texts = [delimiter_rejoin_string.join(bin_pieces).strip() for bin_pieces in bins_of_pieces_after_packing]
+        rejoined_bin_texts = [t for t in rejoined_bin_texts if t]
+
+        if len(rejoined_bin_texts) != target_piece_count:
+            continue
+
+        all_resulting_bin_texts_fit_within_one_chunk = all(
+            _count_content_tokens_in_text_using_clip_tokenizer(text, clip, stream_key)
+            <= CLIP_CONTENT_TOKENS_PER_CHUNK_EXCLUDING_MARKERS
+            for text in rejoined_bin_texts
+        )
+        if all_resulting_bin_texts_fit_within_one_chunk:
+            return rejoined_bin_texts
+
+    return _force_character_split_text_into_n_roughly_equal_substring_pieces(segment_text, target_piece_count)
+
+
+def _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(text, clip, stream_key):
+    """
+    Top-level text-splitter. Returns a list of text pieces where each piece
+    is expected to tokenize to ≤ one 77-token CLIP chunk, BREAK markers are
+    respected as hard boundaries, and pieces within each BREAK segment are
+    roughly balanced in token count.
+    """
+    if not text or not text.strip():
+        return [""]
+
+    hard_segments_separated_by_break_markers = _split_text_at_break_markers_into_hard_segments(text)
+
+    final_text_pieces_ready_to_tokenize = []
+    for segment_text in hard_segments_separated_by_break_markers:
+        if not segment_text:
+            continue
+
+        segment_total_content_token_count = _count_content_tokens_in_text_using_clip_tokenizer(
+            segment_text, clip, stream_key
+        )
+        if segment_total_content_token_count == 0:
+            continue
+
+        target_piece_count_for_segment = max(
+            1,
+            math.ceil(segment_total_content_token_count / float(CLIP_CONTENT_TOKENS_PER_CHUNK_EXCLUDING_MARKERS)),
+        )
+
+        if target_piece_count_for_segment == 1:
+            final_text_pieces_ready_to_tokenize.append(segment_text)
+        else:
+            balanced_sub_pieces_for_this_segment = (
+                _try_to_balance_split_a_single_segment_into_k_pieces_via_delimiter_cascade(
+                    segment_text, target_piece_count_for_segment, clip, stream_key
+                )
+            )
+            final_text_pieces_ready_to_tokenize.extend(balanced_sub_pieces_for_this_segment)
+
+    if not final_text_pieces_ready_to_tokenize:
+        return [""]
+    return final_text_pieces_ready_to_tokenize
+
+
+# -------------- pair encoding helpers --------------
+
+def _pad_token_chunks_dict_g_and_l_to_matching_length(tokens_dict, clip):
+    """
+    Mirrors stock CLIPTextEncodeSDXL's pad-shorter-with-empty logic so g and
+    l have the same chunk count before encoding.
+    """
     empty_tokens_dict = clip.tokenize("")
-    while len(chunks_list_for_g_stream) < target_chunk_count:
-        chunks_list_for_g_stream.append(empty_tokens_dict["g"][0])
-    while len(chunks_list_for_l_stream) < target_chunk_count:
-        chunks_list_for_l_stream.append(empty_tokens_dict["l"][0])
-    return chunks_list_for_g_stream, chunks_list_for_l_stream
+    while len(tokens_dict["l"]) < len(tokens_dict["g"]):
+        tokens_dict["l"] += empty_tokens_dict["l"]
+    while len(tokens_dict["l"]) > len(tokens_dict["g"]):
+        tokens_dict["g"] += empty_tokens_dict["g"]
+    return tokens_dict
+
+
+def _encode_one_paired_text_piece(text_piece_for_g, text_piece_for_l, clip, sdxl_size_conditioning_add_dict):
+    tokens_for_this_pair = clip.tokenize(text_piece_for_g)
+    tokens_for_this_pair["l"] = clip.tokenize(text_piece_for_l)["l"]
+    tokens_for_this_pair = _pad_token_chunks_dict_g_and_l_to_matching_length(tokens_for_this_pair, clip)
+    return clip.encode_from_tokens_scheduled(
+        tokens_for_this_pair, add_dict=sdxl_size_conditioning_add_dict
+    )
 
 
 def _average_per_chunk_conditionings_into_a_single_conditioning_entry(per_chunk_conditioning_list):
     if len(per_chunk_conditioning_list) == 0:
-        raise ValueError("CLIPTextEncodeSDXLAutoSplitAndMerge: cannot average an empty list of per-chunk conditionings.")
+        raise ValueError(
+            "CLIPTextEncodeSDXLAutoSplitAndMerge: cannot average an empty list of per-chunk conditionings."
+        )
 
     first_conditioning = per_chunk_conditioning_list[0]
     first_entry_tokens_tensor = first_conditioning[0][0]
@@ -104,6 +353,8 @@ def _average_per_chunk_conditionings_into_a_single_conditioning_entry(per_chunk_
 
     return [averaged_tokens_tensor, averaged_metadata_dict]
 
+
+# -------------- main node class --------------
 
 class CLIPTextEncodeSDXLAutoSplitAndMerge:
     @classmethod
@@ -149,26 +400,25 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
         split_and_merge_g,
         split_and_merge_l,
     ):
-        raw_tokenizer_output_for_g_stream = clip.tokenize(text_g)
-        raw_tokenizer_output_for_l_stream = clip.tokenize(text_l)
-
-        all_chunks_from_g_stream_before_reduction = list(raw_tokenizer_output_for_g_stream["g"])
-        all_chunks_from_l_stream_before_reduction = list(raw_tokenizer_output_for_l_stream["l"])
-        initial_chunk_count_g = len(all_chunks_from_g_stream_before_reduction)
-        initial_chunk_count_l = len(all_chunks_from_l_stream_before_reduction)
-
-        chunks_to_encode_for_g_stream = _reduce_chunks_list_to_a_single_first_chunk_when_truncating(
-            all_chunks_from_g_stream_before_reduction, split_and_merge_g
+        text_pieces_for_g_stream = _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(
+            text_g, clip, "g"
         )
-        chunks_to_encode_for_l_stream = _reduce_chunks_list_to_a_single_first_chunk_when_truncating(
-            all_chunks_from_l_stream_before_reduction, split_and_merge_l
+        text_pieces_for_l_stream = _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(
+            text_l, clip, "l"
         )
+        initial_piece_count_for_g = len(text_pieces_for_g_stream)
+        initial_piece_count_for_l = len(text_pieces_for_l_stream)
 
-        chunks_to_encode_for_g_stream, chunks_to_encode_for_l_stream = (
-            _pad_two_chunk_lists_to_matching_length_with_empty_chunks(
-                chunks_to_encode_for_g_stream, chunks_to_encode_for_l_stream, clip
-            )
-        )
+        if split_and_merge_g == SPLIT_AND_MERGE_MODE_TRUNCATE and len(text_pieces_for_g_stream) > 0:
+            text_pieces_for_g_stream = text_pieces_for_g_stream[:1]
+        if split_and_merge_l == SPLIT_AND_MERGE_MODE_TRUNCATE and len(text_pieces_for_l_stream) > 0:
+            text_pieces_for_l_stream = text_pieces_for_l_stream[:1]
+
+        paired_piece_count_to_encode = max(len(text_pieces_for_g_stream), len(text_pieces_for_l_stream))
+        while len(text_pieces_for_g_stream) < paired_piece_count_to_encode:
+            text_pieces_for_g_stream.append("")
+        while len(text_pieces_for_l_stream) < paired_piece_count_to_encode:
+            text_pieces_for_l_stream.append("")
 
         sdxl_size_conditioning_add_dict = {
             "width": width,
@@ -179,17 +429,20 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
             "target_height": target_height,
         }
 
-        total_paired_chunk_count_to_encode = len(chunks_to_encode_for_g_stream)
-        per_paired_chunk_conditioning_list = []
-        for paired_chunk_index in range(total_paired_chunk_count_to_encode):
-            tokens_for_this_pair = {
-                "g": [chunks_to_encode_for_g_stream[paired_chunk_index]],
-                "l": [chunks_to_encode_for_l_stream[paired_chunk_index]],
-            }
-            encoded_conditioning_for_this_pair = clip.encode_from_tokens_scheduled(
-                tokens_for_this_pair, add_dict=sdxl_size_conditioning_add_dict
+        per_paired_piece_conditioning_list = []
+        per_paired_piece_token_count_summary_lines = []
+        for paired_piece_index in range(paired_piece_count_to_encode):
+            current_text_piece_g = text_pieces_for_g_stream[paired_piece_index]
+            current_text_piece_l = text_pieces_for_l_stream[paired_piece_index]
+            encoded_pair = _encode_one_paired_text_piece(
+                current_text_piece_g, current_text_piece_l, clip, sdxl_size_conditioning_add_dict
             )
-            per_paired_chunk_conditioning_list.append(encoded_conditioning_for_this_pair)
+            per_paired_piece_conditioning_list.append(encoded_pair)
+            per_paired_piece_token_count_summary_lines.append(
+                f"  pair[{paired_piece_index}]: "
+                f"g_tokens={_count_content_tokens_in_text_using_clip_tokenizer(current_text_piece_g, clip, 'g')}, "
+                f"l_tokens={_count_content_tokens_in_text_using_clip_tokenizer(current_text_piece_l, clip, 'l')}"
+            )
 
         any_stream_is_combine_mode = (
             split_and_merge_g == SPLIT_AND_MERGE_MODE_COMBINE
@@ -202,27 +455,28 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
 
         if any_stream_is_combine_mode:
             output_conditioning_list = []
-            for per_pair_conditioning in per_paired_chunk_conditioning_list:
+            for per_pair_conditioning in per_paired_piece_conditioning_list:
                 output_conditioning_list.extend(per_pair_conditioning)
-            output_summary_text = "combine"
+            output_reduction_strategy_label = "combine"
         elif any_stream_is_average_mode:
             averaged_single_entry = _average_per_chunk_conditionings_into_a_single_conditioning_entry(
-                per_paired_chunk_conditioning_list
+                per_paired_piece_conditioning_list
             )
             output_conditioning_list = [averaged_single_entry]
-            output_summary_text = "average"
+            output_reduction_strategy_label = "average"
         else:
-            output_conditioning_list = per_paired_chunk_conditioning_list[0]
-            output_summary_text = "truncate (first chunk only)"
+            output_conditioning_list = per_paired_piece_conditioning_list[0]
+            output_reduction_strategy_label = "truncate (first piece only)"
 
         debug_info_string = (
-            f"CLIPTextEncodeSDXL (auto-split-and-merge):\n"
-            f"  text_g chunks produced by tokenizer: {initial_chunk_count_g}\n"
-            f"  text_l chunks produced by tokenizer: {initial_chunk_count_l}\n"
+            "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
+            f"  text_g balanced piece count: {initial_piece_count_for_g}\n"
+            f"  text_l balanced piece count: {initial_piece_count_for_l}\n"
             f"  split_and_merge_g: {split_and_merge_g}\n"
             f"  split_and_merge_l: {split_and_merge_l}\n"
-            f"  paired chunk count actually encoded: {total_paired_chunk_count_to_encode}\n"
-            f"  output reduction strategy: {output_summary_text}\n"
+            f"  paired pieces actually encoded: {paired_piece_count_to_encode}\n"
+            + "\n".join(per_paired_piece_token_count_summary_lines)
+            + f"\n  output reduction strategy: {output_reduction_strategy_label}\n"
             f"  final CONDITIONING entry count: {len(output_conditioning_list)}"
         )
 
