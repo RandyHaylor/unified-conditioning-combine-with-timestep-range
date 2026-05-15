@@ -32,7 +32,7 @@ are written to be compatible with downstream pipelines that read either.
 LATENT_TO_IMAGE_SPATIAL_SCALE_FACTOR = 8
 
 ZOOM_MINIMUM_VALUE = 1.0
-ZOOM_MAXIMUM_VALUE = 10.0
+ZOOM_MAXIMUM_VALUE = 100.0
 ZOOM_DEFAULT_VALUE = 1.0
 ZOOM_STEP = 0.01
 
