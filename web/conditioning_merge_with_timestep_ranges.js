@@ -60,19 +60,23 @@ function indexOfTrailingEmptyConditioningSlotInInputsArrayOrMinusOne(node) {
 // -------------- widget add helpers --------------
 
 function addOneSlotHeaderLabelWidget(node, slot_number_to_use) {
-  // Non-serializing label widget. options.serialize=false keeps it out of
-  // widgets_values so positional widget restoration stays aligned.
+  // Header widget that visually groups its slot's triple. It DOES serialize
+  // (value="") so save and load both walk widgets_values in the same order
+  // — using options.serialize=false caused positional misalignment on load
+  // (slot 1's start widget would end up assigned the saved end value).
+  // The displayed slot number is read dynamically from a property on the
+  // widget instance so a rename pass can update it without recreating.
   const slot_header_label_widget = {
     name: `__header_for_slot_${slot_number_to_use}`,
-    type: "custom",
+    type: "header",
     value: "",
-    options: { serialize: false },
+    slot_number_for_display_only: slot_number_to_use,
     draw(canvas_context, owning_node, widget_width_pixels, y_top_pixels, widget_height_pixels) {
       canvas_context.save();
       canvas_context.fillStyle = "#9aa";
       canvas_context.font = "bold 11px Arial, sans-serif";
       canvas_context.textBaseline = "middle";
-      const label_text = `── slot ${slot_number_to_use} ──`;
+      const label_text = `── slot ${this.slot_number_for_display_only} ──`;
       const label_text_x_pixels = 12;
       const label_text_y_pixels = y_top_pixels + widget_height_pixels / 2;
       canvas_context.fillText(label_text, label_text_x_pixels, label_text_y_pixels);
@@ -162,6 +166,43 @@ function rebuildWidgetsArrayMatchingCurrentlyConnectedSlotsOnNode(node) {
 
 // -------------- stabilize: auto-expand on connect, auto-collapse on disconnect --------------
 
+function renumberRemainingConditioningSlotsContiguouslyStartingAtOne(node) {
+  // Walks all conditioning slots in their current input-array order and
+  // re-numbers them 1..N contiguously. Renames the input.name, the three
+  // widgets per slot, and updates the header widget's displayed number.
+  // LiteGraph links reference slot INDEX (not name), so renaming names is
+  // safe for existing wires.
+  if (!node.inputs) return;
+  let next_desired_slot_number = 1;
+  for (const input_descriptor of node.inputs) {
+    if (!input_descriptor || !input_descriptor.name) continue;
+    const match = input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX);
+    if (!match) continue;
+    const current_slot_number = parseInt(match[1], 10);
+    if (current_slot_number !== next_desired_slot_number) {
+      input_descriptor.name = `conditioning_${next_desired_slot_number}`;
+      // Rename widgets.
+      for (const suffix of ["_start", "_end", "_weight"]) {
+        const old_widget_name = `conditioning_${current_slot_number}${suffix}`;
+        const new_widget_name = `conditioning_${next_desired_slot_number}${suffix}`;
+        const widget_index = (node.widgets || []).findIndex((w) => w && w.name === old_widget_name);
+        if (widget_index >= 0) {
+          node.widgets[widget_index].name = new_widget_name;
+        }
+      }
+      // Update header (rename + update displayed number).
+      const old_header_name = `__header_for_slot_${current_slot_number}`;
+      const new_header_name = `__header_for_slot_${next_desired_slot_number}`;
+      const header_index = (node.widgets || []).findIndex((w) => w && w.name === old_header_name);
+      if (header_index >= 0) {
+        node.widgets[header_index].name = new_header_name;
+        node.widgets[header_index].slot_number_for_display_only = next_desired_slot_number;
+      }
+    }
+    next_desired_slot_number++;
+  }
+}
+
 function stabilizeDynamicSlotsOnConditioningMergeNode(node) {
   if (!node.inputs) return;
 
@@ -181,7 +222,11 @@ function stabilizeDynamicSlotsOnConditioningMergeNode(node) {
   // have widgets before.
   rebuildWidgetsArrayMatchingCurrentlyConnectedSlotsOnNode(node);
 
-  // Step 3: add a trailing empty input slot WITHOUT widgets.
+  // Step 3: re-number connected slots so they are contiguous 1..N (no gaps).
+  renumberRemainingConditioningSlotsContiguouslyStartingAtOne(node);
+
+  // Step 4: add a trailing empty input slot WITHOUT widgets, numbered
+  // one past the highest connected slot (post-renumbering this is N+1).
   const next_slot_number = findHighestConditioningSlotIndexFromExistingInputs(node) + 1;
   node.addInput(`conditioning_${next_slot_number}`, "CONDITIONING");
 
