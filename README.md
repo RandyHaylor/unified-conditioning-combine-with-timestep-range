@@ -223,6 +223,42 @@ Outputs:
 
 ---
 
+## Conditioning-crop-zoom-SDXL
+
+Modifies SDXL size/crop conditioning metadata on every CONDITIONING entry
+to create a **framing/composition hint** ("free zoom bias"). It does NOT
+crop or zoom the latent itself — it just rewrites the metadata that SDXL's
+conditioning pipeline reads.
+
+Inputs:
+- `conditioning` (CONDITIONING) — any SDXL-shaped conditioning
+- `latent` (LATENT) — used only to read W/H (latent_W * 8, latent_H * 8)
+- `zoom` (FLOAT, min 1.0) — how much larger to claim the source frame is
+- `offset_x` (FLOAT, -1..+1) — horizontal position of the target window in
+  the larger source frame. -1 = far left, 0 = centered, +1 = far right
+- `offset_y` (FLOAT, -1..+1) — same vertical
+
+What it writes to each entry's metadata (preserves all other keys like
+`start_percent` / `end_percent` / `pooled_output` / `strength`):
+
+| Flat key (ComfyUI form)         | Tuple key (SDXL paper form)     |
+|---------------------------------|---------------------------------|
+| `target_width` / `target_height` | `target_size_as_tuple`          |
+| `width` / `height`              | `original_size_as_tuple`        |
+| `crop_w` / `crop_h`             | `crop_coords_top_left`          |
+
+Math:
+- `target = latent W/H`
+- `source = round(latent W/H * zoom)`
+- `crop = (offset+1)/2 * (source - target)` per axis
+
+Example: latent=1024², zoom=2.0 → source=2048², max crop window=1024².
+- `offset_x=0, offset_y=0` → crop=(512, 512) (centered)
+- `offset_x=-1, offset_y=+1` → crop=(0, 1024) (top-left of source, but
+  framed to show the bottom-right of the implied larger image)
+
+---
+
 ## License
 
 MIT — see `LICENSE`.
