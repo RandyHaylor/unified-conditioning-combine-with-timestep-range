@@ -163,20 +163,55 @@ def _split_text_at_break_markers_into_hard_segments(text):
     return cleaned_segments_after_stripping_whitespace
 
 
-def _force_character_split_text_into_n_roughly_equal_substring_pieces(text, target_piece_count):
-    """Last-resort even-length character slicing when no delimiter works."""
-    if target_piece_count <= 1:
-        return [text]
-    average_piece_length_in_characters = max(1, len(text) // target_piece_count)
-    output_pieces_after_character_slicing = []
-    for piece_index in range(target_piece_count):
-        slice_start_character_index = piece_index * average_piece_length_in_characters
-        if piece_index == target_piece_count - 1:
+def _force_character_split_text_into_fit_guaranteed_pieces(
+    text, target_piece_count_as_starting_point, clip, stream_key
+):
+    """
+    Last-resort character-based split. Starts at `target_piece_count_as_starting_point`
+    roughly-equal substring slices, then iteratively halves any piece still
+    exceeding the per-chunk token budget. Returns pieces that EACH fit within
+    one CLIP chunk; may return MORE than the starting count if necessary
+    (rare — only for pathological inputs like a single very long URL or
+    dense Unicode with no delimiters).
+    """
+    if not text:
+        return [""]
+    if target_piece_count_as_starting_point <= 1:
+        target_piece_count_as_starting_point = 1
+    average_piece_length_in_characters = max(1, len(text) // target_piece_count_as_starting_point)
+    pieces_after_initial_character_slicing = []
+    for piece_index_in_initial_slicing in range(target_piece_count_as_starting_point):
+        slice_start_character_index = piece_index_in_initial_slicing * average_piece_length_in_characters
+        if piece_index_in_initial_slicing == target_piece_count_as_starting_point - 1:
             slice_end_character_index = len(text)
         else:
-            slice_end_character_index = (piece_index + 1) * average_piece_length_in_characters
-        output_pieces_after_character_slicing.append(text[slice_start_character_index:slice_end_character_index])
-    return output_pieces_after_character_slicing
+            slice_end_character_index = (piece_index_in_initial_slicing + 1) * average_piece_length_in_characters
+        pieces_after_initial_character_slicing.append(text[slice_start_character_index:slice_end_character_index])
+
+    # Iteratively halve any piece that still exceeds the token budget.
+    # Bound the number of halving passes to avoid pathological infinite loops.
+    maximum_halving_passes_to_attempt = 12
+    for _halving_pass_index in range(maximum_halving_passes_to_attempt):
+        any_piece_still_oversized_after_this_pass = False
+        pieces_after_this_halving_pass = []
+        for current_piece_text in pieces_after_initial_character_slicing:
+            if not current_piece_text:
+                pieces_after_this_halving_pass.append(current_piece_text)
+                continue
+            current_piece_token_count = _count_content_tokens_in_text_using_clip_tokenizer(
+                current_piece_text, clip, stream_key
+            )
+            if current_piece_token_count <= CLIP_CONTENT_TOKENS_PER_CHUNK_EXCLUDING_MARKERS:
+                pieces_after_this_halving_pass.append(current_piece_text)
+            else:
+                any_piece_still_oversized_after_this_pass = True
+                halving_split_character_index = max(1, len(current_piece_text) // 2)
+                pieces_after_this_halving_pass.append(current_piece_text[:halving_split_character_index])
+                pieces_after_this_halving_pass.append(current_piece_text[halving_split_character_index:])
+        pieces_after_initial_character_slicing = pieces_after_this_halving_pass
+        if not any_piece_still_oversized_after_this_pass:
+            break
+    return pieces_after_initial_character_slicing
 
 
 def _greedy_bin_pack_pieces_into_k_bins_targeting_equal_token_count(
@@ -249,7 +284,9 @@ def _try_to_balance_split_a_single_segment_into_k_pieces_via_delimiter_cascade(
         if all_resulting_bin_texts_fit_within_one_chunk:
             return rejoined_bin_texts
 
-    return _force_character_split_text_into_n_roughly_equal_substring_pieces(segment_text, target_piece_count)
+    return _force_character_split_text_into_fit_guaranteed_pieces(
+        segment_text, target_piece_count, clip, stream_key
+    )
 
 
 def _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(text, clip, stream_key):
