@@ -7,7 +7,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ConditioningMergeWithTimestepRanges": "Conditioning Merge (with timestep ranges)",
+    "ConditioningMergeWithTimestepRanges": "Unified Conditioning Merge (with timestep ranges)",
     "DebugConditioning": "Debug Conditioning",
 }
 
