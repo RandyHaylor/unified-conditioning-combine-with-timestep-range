@@ -1,17 +1,13 @@
-from .conditioning_concat_with_timestep_ranges import ConditioningConcatWithTimestepRanges
-from .conditioning_combine_with_timestep_ranges import ConditioningCombineWithTimestepRanges
-from .conditioning_average_with_timestep_ranges import ConditioningAverageWithTimestepRanges
+from .conditioning_merge_with_timestep_ranges import ConditioningMergeWithTimestepRanges
 
 NODE_CLASS_MAPPINGS = {
-    "ConditioningConcatWithTimestepRanges": ConditioningConcatWithTimestepRanges,
-    "ConditioningCombineWithTimestepRanges": ConditioningCombineWithTimestepRanges,
-    "ConditioningAverageWithTimestepRanges": ConditioningAverageWithTimestepRanges,
+    "ConditioningMergeWithTimestepRanges": ConditioningMergeWithTimestepRanges,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ConditioningConcatWithTimestepRanges": "Conditioning Concat (with timestep ranges)",
-    "ConditioningCombineWithTimestepRanges": "Conditioning Combine (with timestep ranges)",
-    "ConditioningAverageWithTimestepRanges": "Conditioning Average (with timestep ranges)",
+    "ConditioningMergeWithTimestepRanges": "Conditioning Merge (with timestep ranges)",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
