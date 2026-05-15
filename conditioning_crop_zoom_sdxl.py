@@ -111,9 +111,14 @@ def _apply_metadata_fields_to_each_entry_of_one_conditioning(
 class ConditioningCropZoomSDXL:
     @classmethod
     def INPUT_TYPES(cls):
+        # Optional inputs render AFTER required inputs in ComfyUI's layout, so
+        # to get the visual order positive → negative → latent we have to put
+        # negative in `required`. Users who don't want a negative input on
+        # this node can still wire an empty/zero CONDITIONING into it.
         return {
             "required": {
                 "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
                 "latent": ("LATENT",),
                 "zoom": ("FLOAT", {
                     "default": ZOOM_DEFAULT_VALUE,
@@ -134,9 +139,6 @@ class ConditioningCropZoomSDXL:
                     "step": OFFSET_STEP,
                 }),
             },
-            "optional": {
-                "negative": ("CONDITIONING",),
-            },
         }
 
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
@@ -145,7 +147,7 @@ class ConditioningCropZoomSDXL:
     CATEGORY = "unified-conditioning-merge"
 
     def apply_sdxl_zoom_metadata_to_positive_and_negative_conditionings(
-        self, positive, latent, zoom, offset_x, offset_y, negative=None
+        self, positive, negative, latent, zoom, offset_x, offset_y
     ):
         zoom_factor_clamped_at_or_above_one = max(ZOOM_MINIMUM_VALUE, float(zoom))
         offset_x_clamped = _clamp_numeric_value_inclusive(
