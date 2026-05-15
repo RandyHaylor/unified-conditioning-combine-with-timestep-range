@@ -72,7 +72,7 @@ class DebugConditioning:
     RETURN_TYPES = ("CONDITIONING", "STRING")
     RETURN_NAMES = ("conditioning", "debug_text")
     FUNCTION = "debug"
-    CATEGORY = "advanced/conditioning"
+    CATEGORY = "unified-conditioning-merge"
     OUTPUT_NODE = True
 
     def debug(self, conditioning, label):

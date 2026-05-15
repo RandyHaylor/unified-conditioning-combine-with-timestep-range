@@ -287,7 +287,7 @@ class ConditioningMergeWithTimestepRanges:
 
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "merge_with_timestep_ranges"
-    CATEGORY = "advanced/conditioning"
+    CATEGORY = "unified-conditioning-merge"
 
     def merge_with_timestep_ranges(self, **kwargs):
         merge_mode = kwargs.get("merge_mode", MERGE_MODE_CONCAT)
