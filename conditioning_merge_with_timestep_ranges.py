@@ -177,6 +177,83 @@ def _merge_in_combine_mode(per_entry_input_records):
     return output_conditioning_entries
 
 
+def _detect_overlapping_entries_within_any_single_slot(per_slot_dict):
+    """
+    Returns the first (slot_index, range_a, range_b) tuple where one slot has
+    two entries whose effective timestep ranges overlap, or None if no slot
+    has any overlapping entries.
+
+    Overlapping entries on a single slot indicate upstream parallel-branch
+    conditioning (typically the output of a 'combine' mode). Flat merge modes
+    (concat / average / average_normalized) cannot represent parallel branches
+    in their single-merged-segment output, so we refuse to run with such an
+    input rather than silently flattening it.
+    """
+    for slot_index in sorted(per_slot_dict.keys()):
+        slot_data = per_slot_dict[slot_index]
+        conditioning_list = slot_data["conditioning"]
+        if conditioning_list is None or len(conditioning_list) < 2:
+            continue
+        widget_start_for_slot = slot_data["start"]
+        widget_end_for_slot = slot_data["end"]
+        effective_ranges_for_each_entry_on_this_slot = []
+        for conditioning_entry in conditioning_list:
+            entry_metadata_dict = conditioning_entry[1]
+            effective_start, effective_end = compute_effective_range_from_widget_and_upstream(
+                widget_start_for_slot, widget_end_for_slot, entry_metadata_dict
+            )
+            if effective_end > effective_start:
+                effective_ranges_for_each_entry_on_this_slot.append((effective_start, effective_end))
+        for first_index_in_ranges_list in range(len(effective_ranges_for_each_entry_on_this_slot)):
+            for second_index_in_ranges_list in range(first_index_in_ranges_list + 1, len(effective_ranges_for_each_entry_on_this_slot)):
+                range_a_start, range_a_end = effective_ranges_for_each_entry_on_this_slot[first_index_in_ranges_list]
+                range_b_start, range_b_end = effective_ranges_for_each_entry_on_this_slot[second_index_in_ranges_list]
+                if max(range_a_start, range_b_start) < min(range_a_end, range_b_end):
+                    return (
+                        slot_index,
+                        (range_a_start, range_a_end),
+                        (range_b_start, range_b_end),
+                    )
+    return None
+
+
+def _raise_value_error_if_flat_merge_mode_would_destroy_parallel_branches(per_slot_dict, merge_mode):
+    overlap_detection_result = _detect_overlapping_entries_within_any_single_slot(per_slot_dict)
+    if overlap_detection_result is None:
+        return
+    offending_slot_index, range_a, range_b = overlap_detection_result
+    range_a_start, range_a_end = range_a
+    range_b_start, range_b_end = range_b
+    error_message_lines = [
+        f"Unified Conditioning Merge (mode='{merge_mode}'): cannot accept this input.",
+        "",
+        f"Input on slot {offending_slot_index} is delivering MULTIPLE separate conditionings",
+        f"that overlap in time:",
+        f"  - one covers timesteps [{range_a_start:.4f} → {range_a_end:.4f}]",
+        f"  - another covers timesteps [{range_b_start:.4f} → {range_b_end:.4f}]",
+        "",
+        "This shape of input is produced by 'combine' mode, which intentionally keeps the",
+        "prompts as separate parallel branches so the sampler evaluates them independently",
+        "and blends their predictions at each step.",
+        "",
+        f"The '{merge_mode}' mode you chose on THIS node would do the opposite: it would",
+        "glue all the prompt tokens together into one single prompt per timestep segment.",
+        "Doing that here would erase the upstream split entirely — your earlier 'combine'",
+        "node would have had no effect on the image. We refuse rather than silently destroy",
+        "that parallel structure.",
+        "",
+        "Three ways to fix this:",
+        f"  1. Change THIS node's mode from '{merge_mode}' to 'combine'. The parallel",
+        "     branches pass through unchanged and the sampler honors them.",
+        "  2. Change the UPSTREAM node from 'combine' to 'concat' (or 'average' /",
+        "     'average_normalized'). The earlier split is replaced with token-level",
+        "     gluing, and this node then sees only one entry per slot.",
+        f"  3. Restructure so no node downstream of a 'combine' uses '{merge_mode}'",
+        "     mode — keep 'combine' all the way out to the sampler.",
+    ]
+    raise ValueError("\n".join(error_message_lines))
+
+
 def _select_records_active_in_sub_interval(per_entry_input_records, sub_interval_start, sub_interval_end):
     return [
         record for record in per_entry_input_records
@@ -302,6 +379,7 @@ class ConditioningMergeWithTimestepRanges:
         if merge_mode == MERGE_MODE_COMBINE:
             output_conditioning_entries = _merge_in_combine_mode(per_entry_input_records)
         else:
+            _raise_value_error_if_flat_merge_mode_would_destroy_parallel_branches(per_slot_dict, merge_mode)
             output_conditioning_entries = _merge_in_segmented_mode(per_entry_input_records, merge_mode)
 
         return (output_conditioning_entries,)
