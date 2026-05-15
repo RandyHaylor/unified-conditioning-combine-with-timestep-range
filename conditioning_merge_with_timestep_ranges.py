@@ -4,7 +4,7 @@ Conditioning Merge (with timestep ranges).
 A single unified node that replaces the previous three (Concat / Combine /
 Average). Features:
 
-  - merge_mode dropdown: "concat" | "combine" | "average" | "average_normalized"
+  - merge_mode dropdown: "concat" | "combine" | "average_additive" | "average_normalized"
   - Dynamic 1..N CONDITIONING input slots (driven by web/conditioning_merge_with_timestep_ranges.js).
   - Each slot has three widgets: start, end, weight.
       - start/end intersect with that input's upstream start_percent/end_percent
@@ -13,10 +13,10 @@ Average). Features:
           concat              : torch.cat([weight_i * tokens_i for active], dim=1)
           combine             : each emitted entry gets metadata['strength'] = weight_i
                                 (only written when weight != 1.0, to preserve stock semantics by default)
-          average             : sum(weight_i * tokens_i for active)
+          average_additive    : sum(weight_i * tokens_i for active)
           average_normalized  : sum(weight_i * tokens_i) / sum(weight_i)   over active subset
 
-For concat / average / average_normalized, the [0,1] timestep span is segmented
+For concat / average_additive / average_normalized, the [0,1] timestep span is segmented
 at every active slot's effective-range endpoints; each non-empty sub-interval
 emits one CONDITIONING entry. Stock samplers honor each entry's
 start_percent/end_percent via comfy/samplers.py:calculate_start_end_timesteps.
@@ -43,13 +43,13 @@ CONDITIONING_SLOT_KEY_PATTERN = re.compile(r"^conditioning_(\d+)(_start|_end|_we
 
 MERGE_MODE_CONCAT = "concat"
 MERGE_MODE_COMBINE = "combine"
-MERGE_MODE_AVERAGE = "average"
+MERGE_MODE_AVERAGE_ADDITIVE = "average_additive"
 MERGE_MODE_AVERAGE_NORMALIZED = "average_normalized"
 
 MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER = [
     MERGE_MODE_CONCAT,
     MERGE_MODE_COMBINE,
-    MERGE_MODE_AVERAGE,
+    MERGE_MODE_AVERAGE_ADDITIVE,
     MERGE_MODE_AVERAGE_NORMALIZED,
 ]
 
@@ -323,7 +323,7 @@ def _merge_in_segmented_mode(per_entry_input_records, merge_mode):
         if merge_mode == MERGE_MODE_CONCAT:
             emitted_tokens_tensor = _concat_active_records_with_weights(active_records)
             emitted_metadata_dict = active_records[0]["metadata_dict"].copy()
-        elif merge_mode == MERGE_MODE_AVERAGE:
+        elif merge_mode == MERGE_MODE_AVERAGE_ADDITIVE:
             emitted_tokens_tensor, blended_pooled_output = _blend_active_records_with_weights(
                 active_records, normalize_by_sum_of_weights=False
             )

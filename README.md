@@ -28,7 +28,7 @@ category.
 
 ## Merge node UI
 
-- **merge_mode** (dropdown) — one of `concat` / `combine` / `average` /
+- **merge_mode** (dropdown) — one of `concat` / `combine` / `average_additive` /
   `average_normalized`. See below.
 - **conditioning_N** (input slot) — a CONDITIONING input. The node always
   has exactly one trailing empty slot; connect it and a new empty slot
@@ -50,14 +50,14 @@ category.
 |----------------------|--------------------------------------------------------------------------------------------------------------------|
 | `concat`             | **Glues prompts end-to-end into one longer prompt per timestep segment.** Tokens are concatenated; the sampler reads ONE longer conditioning.       |
 | `combine`            | **Hands the prompts to the sampler as separate parallel branches.** The sampler runs the model once per active branch each step and blends results. |
-| `average`            | **Mathematically blends the embeddings into one prompt per timestep segment** using your weights. NOT normalized — can boost or suppress overall.    |
-| `average_normalized` | Same as `average` but divides by the sum of active weights so the output magnitude stays comparable to a single prompt.                              |
+| `average_additive`   | **Mathematically blends the embeddings into one prompt per timestep segment** using your weights as raw additive coefficients. NOT normalized — can boost or suppress overall magnitude. |
+| `average_normalized` | Same blend as `average_additive` but divides by the sum of active weights so the output magnitude stays comparable to a single prompt.                                                  |
 
 ### Two fundamentally different shapes
 
 This matters when chaining. Modes produce two different output shapes:
 
-- **Concat / average / average_normalized** produce one output **segment**
+- **Concat / average_additive / average_normalized** produce one output **segment**
   per non-overlapping timestep interval, with each segment containing ONE
   cond. Sequential in time. The sampler picks one segment per step.
 - **Combine** produces one output **branch** per input, all carrying their
@@ -72,14 +72,14 @@ This matters when chaining. Modes produce two different output shapes:
 |----------------------|-----------------------------------------------------------------------------------------------------------------|
 | `concat`             | Tokens are pre-scaled by `weight_i` before concatenation (`torch.cat([w_i * t_i for active], dim=1)`). Equivalent to CLIP `(token:weight)` syntax. |
 | `combine`            | Each emitted entry gets `metadata['strength'] = weight_i` (only if != 1.0). Equivalent to chaining `ConditioningSetAreaStrength` on each input.   |
-| `average`            | Each input's contribution is scaled by `weight_i` in the weighted sum, with NO division by total weight.        |
+| `average_additive`   | Each input's contribution is scaled by `weight_i` in the weighted sum, with NO division by total weight.        |
 | `average_normalized` | Each input's contribution is `weight_i / sum(active_weights)` — proper weighted average.                        |
 
 Default `weight = 1.0` keeps everything in stock-compatible territory.
 
 ---
 
-## Timestep range segmentation (concat / average modes)
+## Timestep range segmentation (concat / average_additive / average_normalized modes)
 
 When inputs have different effective ranges, the node breaks the [0, 1]
 timestep span at every endpoint and emits one CONDITIONING entry per
@@ -131,9 +131,9 @@ prompt execution fails until you fix the structure.
 The error names the slot, prints the two overlapping ranges, and lists three
 ways to fix it:
 
-1. Change THIS node's mode from `concat` / `average` / `average_normalized`
-   to `combine`. Parallel branches pass through.
-2. Change the UPSTREAM node from `combine` to `concat` / `average` /
+1. Change THIS node's mode from `concat` / `average_additive` /
+   `average_normalized` to `combine`. Parallel branches pass through.
+2. Change the UPSTREAM node from `combine` to `concat` / `average_additive` /
    `average_normalized`. The earlier split is replaced with token-level
    merging, and this node sees only one entry per slot.
 3. Restructure so `combine` mode is kept all the way out to the sampler;
@@ -149,7 +149,7 @@ than wonder why your knob isn't doing anything.
 "Overlapping ranges within a single slot" is the signature of parallel
 branches. The flat modes refuse if ANY single slot has two or more entries
 whose effective timestep windows overlap. Sequential entries (segments from
-upstream concat / average) on a slot — non-overlapping — are fine and
+upstream concat / average_additive / average_normalized) on a slot — non-overlapping — are fine and
 common, so concat → concat chains stay supported.
 
 ---
