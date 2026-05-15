@@ -65,20 +65,21 @@ import torch
 import nodes
 
 
-SPLIT_AND_MERGE_MODE_CONCAT = "concat"
+SPLIT_AND_MERGE_MODE_CONCAT = "concat (default)"
 SPLIT_AND_MERGE_MODE_TRUNCATE = "truncate"
 SPLIT_AND_MERGE_MODE_COMBINE = "combine"
 SPLIT_AND_MERGE_MODE_AVERAGE = "average"
 
-# Dropdown order. `concat` is first → default. It reproduces stock
-# CLIPTextEncodeSDXL's "encode every chunk in one call, concat the resulting
-# 77-token outputs along the sequence dim" behavior, while still respecting
-# BREAK markers as forced chunk boundaries.
+# Dropdown order. `concat (default)` is first → default. It reproduces
+# stock CLIPTextEncodeSDXL's "encode every chunk in one call, concat the
+# resulting 77-token outputs along the sequence dim" behavior, while still
+# respecting BREAK markers as forced chunk boundaries. `truncate` is LAST
+# because it's the least-commonly-wanted option (it drops overflow tokens).
 SPLIT_AND_MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER = [
     SPLIT_AND_MERGE_MODE_CONCAT,
-    SPLIT_AND_MERGE_MODE_TRUNCATE,
     SPLIT_AND_MERGE_MODE_COMBINE,
     SPLIT_AND_MERGE_MODE_AVERAGE,
+    SPLIT_AND_MERGE_MODE_TRUNCATE,
 ]
 
 # Highest-priority mode determines which encoding pipeline the node runs.
