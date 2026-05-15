@@ -17,11 +17,11 @@ dynamic-input node that:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/RandyHaylor/unified-conditioning-combine-with-timestep-range.git conditioning_merge_nodes_with_timestep_range
+git clone https://github.com/RandyHaylor/unified-conditioning-combine-with-timestep-range.git unified-conditioning-merge
 ```
 
-Restart ComfyUI. The node appears under **advanced/conditioning** as
-**"Conditioning Merge (with timestep ranges)"**.
+Restart ComfyUI. The node appears under the **unified-conditioning-merge**
+category as **"Unified Conditioning Merge (with timestep ranges)"**.
 
 ## Node UI
 
