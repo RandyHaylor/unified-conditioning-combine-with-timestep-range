@@ -5,12 +5,20 @@ A single ComfyUI custom node that fixes a long-standing issue with stock
 `start_percent` / `end_percent` metadata from the `from`-side input, so a
 `ConditioningSetTimestepRange` placed before that input has no effect.
 
-This pack ships a unified merge node plus a small debug node:
+This pack ships:
 
 - **Unified Conditioning Merge (with timestep ranges)** — replaces stock
   Concat / Combine / Average in one node with a mode dropdown,
   dynamic 1..N inputs, per-slot weights and timestep ranges, and full
   metadata carry-through across both sides.
+- **CLIPTextEncodeSDXL (auto-split-and-merge)** — drop-in extension of
+  stock SDXL text encoder with smart splitting at `BREAK` / comma / line /
+  whitespace boundaries when a prompt exceeds 77 tokens. Per-stream
+  truncate / combine / average dropdowns.
+- **Conditioning-crop-zoom-SDXL** — rewrites SDXL size/crop conditioning
+  metadata using the latent's actual W/H plus a zoom factor and offset.
+  Recommended as the FINAL stop on both positive and negative
+  conditioning before the sampler (see its section below).
 - **Debug Conditioning** — in-line passthrough that prints CONDITIONING
   structure to the server console and emits a STRING dump output.
 
@@ -255,15 +263,22 @@ crop or zoom the latent itself — it just rewrites the metadata that SDXL's
 conditioning pipeline reads.
 
 Inputs:
-- `conditioning` (CONDITIONING) — any SDXL-shaped conditioning
+- `positive` (CONDITIONING, required) — positive-prompt conditioning
+- `negative` (CONDITIONING, optional) — negative-prompt conditioning; gets
+  the same metadata written. If unconnected, the `negative` output is empty.
 - `latent` (LATENT) — used only to read W/H (latent_W * 8, latent_H * 8)
 - `zoom` (FLOAT, min 1.0) — how much larger to claim the source frame is
 - `offset_x` (FLOAT, -1..+1) — horizontal position of the target window in
   the larger source frame. -1 = far left, 0 = centered, +1 = far right
 - `offset_y` (FLOAT, -1..+1) — same vertical
 
-What it writes to each entry's metadata (preserves all other keys like
-`start_percent` / `end_percent` / `pooled_output` / `strength`):
+Outputs:
+- `positive` (CONDITIONING) — same as input with size/crop metadata updated.
+- `negative` (CONDITIONING) — same.
+
+What it writes to each entry's metadata on BOTH pos and neg (preserves
+all other keys like `start_percent` / `end_percent` / `pooled_output` /
+`strength`):
 
 | Flat key (ComfyUI form)         | Tuple key (SDXL paper form)     |
 |---------------------------------|---------------------------------|
@@ -280,6 +295,30 @@ Example: latent=1024², zoom=2.0 → source=2048², max crop window=1024².
 - `offset_x=0, offset_y=0` → crop=(512, 512) (centered)
 - `offset_x=-1, offset_y=+1` → crop=(0, 1024) (top-left of source, but
   framed to show the bottom-right of the implied larger image)
+
+### Recommended placement: ALWAYS the final stop before the sampler
+
+Put this node at the very end of your conditioning graph, with **both
+positive and negative** wired through it, and connect its two outputs to
+the sampler's `positive` and `negative` inputs respectively. Two reasons:
+
+1. **Convenience / safety:** it auto-derives `target_width` / `target_height`
+   from the latent you're sampling against, so you can't accidentally
+   drift between rendered size and conditioning size when changing
+   resolution. Stock `CLIPTextEncodeSDXL` hardcodes these to defaults
+   that may not match your latent.
+2. **Quality bias:** even at default `zoom=1.0, offset=0` you've fixed
+   the conditioning's W/H to the actual latent W/H. With `zoom > 1.0`
+   you get a "free zoom bias" — the model is told the rendered frame is
+   a sub-crop of a larger source image, which empirically often produces
+   better-composed and higher-detail output (SDXL was trained with
+   non-zero crop coords on a large fraction of its data, so claiming
+   `crop=0` with `source=target` puts you in a thinly-trained slice of
+   its conditioning distribution).
+
+Setting it to default (`zoom=1.0, offsets=0`) is already an improvement
+over not using it at all, because it pins target/source to your real
+latent size on BOTH pos and neg in one node.
 
 ---
 

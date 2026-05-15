@@ -87,12 +87,33 @@ def _compute_sdxl_size_and_crop_metadata_fields_from_latent_and_zoom_and_offsets
     }
 
 
+def _apply_metadata_fields_to_each_entry_of_one_conditioning(
+    input_conditioning_list_or_none, metadata_fields_to_merge_into_each_entry
+):
+    """
+    Returns a new CONDITIONING list with the same per-entry tensors but each
+    entry's metadata dict updated to include the given metadata fields.
+    Returns an empty list when the input is None (caller didn't connect this
+    optional input).
+    """
+    if input_conditioning_list_or_none is None:
+        return []
+    output_conditioning_entries = []
+    for conditioning_entry in input_conditioning_list_or_none:
+        entry_tokens_tensor = conditioning_entry[0]
+        entry_metadata_dict = conditioning_entry[1]
+        updated_metadata_dict = dict(entry_metadata_dict)
+        updated_metadata_dict.update(metadata_fields_to_merge_into_each_entry)
+        output_conditioning_entries.append([entry_tokens_tensor, updated_metadata_dict])
+    return output_conditioning_entries
+
+
 class ConditioningCropZoomSDXL:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "conditioning": ("CONDITIONING",),
+                "positive": ("CONDITIONING",),
                 "latent": ("LATENT",),
                 "zoom": ("FLOAT", {
                     "default": ZOOM_DEFAULT_VALUE,
@@ -112,16 +133,19 @@ class ConditioningCropZoomSDXL:
                     "max": OFFSET_MAXIMUM_VALUE,
                     "step": OFFSET_STEP,
                 }),
-            }
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+            },
         }
 
-    RETURN_TYPES = ("CONDITIONING",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "apply_sdxl_zoom_metadata_to_each_conditioning_entry"
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "apply_sdxl_zoom_metadata_to_positive_and_negative_conditionings"
     CATEGORY = "unified-conditioning-merge"
 
-    def apply_sdxl_zoom_metadata_to_each_conditioning_entry(
-        self, conditioning, latent, zoom, offset_x, offset_y
+    def apply_sdxl_zoom_metadata_to_positive_and_negative_conditionings(
+        self, positive, latent, zoom, offset_x, offset_y, negative=None
     ):
         zoom_factor_clamped_at_or_above_one = max(ZOOM_MINIMUM_VALUE, float(zoom))
         offset_x_clamped = _clamp_numeric_value_inclusive(
@@ -145,12 +169,11 @@ class ConditioningCropZoomSDXL:
             )
         )
 
-        output_conditioning_entries = []
-        for conditioning_entry in conditioning:
-            entry_tokens_tensor = conditioning_entry[0]
-            entry_metadata_dict = conditioning_entry[1]
-            updated_metadata_dict = dict(entry_metadata_dict)
-            updated_metadata_dict.update(metadata_fields_to_merge_into_each_entry)
-            output_conditioning_entries.append([entry_tokens_tensor, updated_metadata_dict])
+        output_positive_conditioning_entries = _apply_metadata_fields_to_each_entry_of_one_conditioning(
+            positive, metadata_fields_to_merge_into_each_entry
+        )
+        output_negative_conditioning_entries = _apply_metadata_fields_to_each_entry_of_one_conditioning(
+            negative, metadata_fields_to_merge_into_each_entry
+        )
 
-        return (output_conditioning_entries,)
+        return (output_positive_conditioning_entries, output_negative_conditioning_entries)
