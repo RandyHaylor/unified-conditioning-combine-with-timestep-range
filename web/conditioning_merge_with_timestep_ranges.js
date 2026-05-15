@@ -93,7 +93,37 @@ function indexOfTrailingEmptyConditioningSlotInInputsArrayOrMinusOne(node) {
 
 function addOneConditioningInputSlotAndItsWidgetTriple(node, slot_number_to_use) {
   node.addInput(`conditioning_${slot_number_to_use}`, "CONDITIONING");
+  addOneSlotHeaderLabelWidget(node, slot_number_to_use);
   addOneWidgetTripleForSlot(node, slot_number_to_use);
+}
+
+function addOneSlotHeaderLabelWidget(node, slot_number_to_use) {
+  // Non-serializing label widget that visually groups the three widgets
+  // belonging to this slot. `options.serialize = false` keeps it out of
+  // widgets_values so it doesn't disturb positional widget restoration.
+  const slot_header_label_widget = {
+    name: `__header_for_slot_${slot_number_to_use}`,
+    type: "custom",
+    value: "",
+    options: { serialize: false },
+    draw(canvas_context, owning_node, widget_width_pixels, y_top_pixels, widget_height_pixels) {
+      canvas_context.save();
+      canvas_context.fillStyle = "#9aa";
+      canvas_context.font = "bold 11px Arial, sans-serif";
+      canvas_context.textBaseline = "middle";
+      const label_text = `── slot ${slot_number_to_use} ──`;
+      const label_text_x_pixels = 12;
+      const label_text_y_pixels = y_top_pixels + widget_height_pixels / 2;
+      canvas_context.fillText(label_text, label_text_x_pixels, label_text_y_pixels);
+      canvas_context.restore();
+    },
+    computeSize(available_widget_width_pixels) {
+      return [available_widget_width_pixels, 16];
+    },
+  };
+  if (!node.widgets) node.widgets = [];
+  node.widgets.push(slot_header_label_widget);
+  return slot_header_label_widget;
 }
 
 function addOneWidgetTripleForSlot(node, slot_number_to_use) {
@@ -120,6 +150,41 @@ function addOneWidgetTripleForSlot(node, slot_number_to_use) {
   );
 }
 
+function rebuildWidgetsArrayWithHeadersInFrontOfEachSlotTripleOnNode(node) {
+  // Preserve current values of merge_mode and each slot's start/end/weight
+  // widgets (if present) so a rebuild doesn't reset user-edited values.
+  const captured_widget_values_by_name = {};
+  for (const widget_descriptor of node.widgets || []) {
+    if (widget_descriptor && widget_descriptor.name && widget_descriptor.value !== undefined) {
+      captured_widget_values_by_name[widget_descriptor.name] = widget_descriptor.value;
+    }
+  }
+  // Wipe everything past the merge_mode widget at index 0.
+  while (node.widgets && node.widgets.length > 1) {
+    node.widgets.pop();
+  }
+  // Re-add header + triple for each conditioning_<N> input slot.
+  for (const input_descriptor of node.inputs || []) {
+    const match = input_descriptor && input_descriptor.name
+      ? input_descriptor.name.match(CONDITIONING_INPUT_NAME_REGEX)
+      : null;
+    if (!match) continue;
+    const slot_number = parseInt(match[1], 10);
+    addOneSlotHeaderLabelWidget(node, slot_number);
+    addOneWidgetTripleForSlot(node, slot_number);
+    // Restore captured values if we had them.
+    for (const suffix of ["_start", "_end", "_weight"]) {
+      const widget_name = `conditioning_${slot_number}${suffix}`;
+      if (captured_widget_values_by_name[widget_name] !== undefined) {
+        const widget_index = node.widgets.findIndex((w) => w && w.name === widget_name);
+        if (widget_index >= 0) {
+          node.widgets[widget_index].value = captured_widget_values_by_name[widget_name];
+        }
+      }
+    }
+  }
+}
+
 function removeOneConditioningInputSlotAtIndexAndItsWidgetTriple(node, slot_index_in_inputs_array) {
   if (!node.inputs || slot_index_in_inputs_array < 0 || slot_index_in_inputs_array >= node.inputs.length) return;
   const input_descriptor = node.inputs[slot_index_in_inputs_array];
@@ -131,9 +196,13 @@ function removeOneConditioningInputSlotAtIndexAndItsWidgetTriple(node, slot_inde
 
   node.removeInput(slot_index_in_inputs_array);
 
-  const widget_name_suffixes_to_remove_in_reverse_order = ["_weight", "_end", "_start"];
-  for (const suffix of widget_name_suffixes_to_remove_in_reverse_order) {
-    const widget_name_to_find = `conditioning_${slot_number_string_extracted_from_input_name}${suffix}`;
+  const widget_names_to_remove_for_this_slot = [
+    `conditioning_${slot_number_string_extracted_from_input_name}_weight`,
+    `conditioning_${slot_number_string_extracted_from_input_name}_end`,
+    `conditioning_${slot_number_string_extracted_from_input_name}_start`,
+    `__header_for_slot_${slot_number_string_extracted_from_input_name}`,
+  ];
+  for (const widget_name_to_find of widget_names_to_remove_for_this_slot) {
     const widget_index_in_widgets_array = (node.widgets || []).findIndex(
       (widget_descriptor) => widget_descriptor && widget_descriptor.name === widget_name_to_find,
     );
@@ -348,6 +417,12 @@ app.registerExtension({
       const original_result = original_on_node_created_function
         ? original_on_node_created_function.apply(this, arguments)
         : undefined;
+      // ComfyUI's auto-build creates widgets for INPUT_TYPES.required (merge_mode
+      // + slot_1 triple) but with no header above slot 1. Normalize the widget
+      // layout so every slot's triple is preceded by a non-serializing header
+      // label widget. We rebuild the widgets array fresh, preserving the auto-
+      // built values for slot 1's triple (they match INPUT_TYPES defaults).
+      rebuildWidgetsArrayWithHeadersInFrontOfEachSlotTripleOnNode(this);
       scheduleStabilizationOnNode(this);
       return original_result;
     };
@@ -367,8 +442,10 @@ app.registerExtension({
       while (this.widgets && this.widgets.length > 1) {
         this.widgets.pop();
       }
-      // Rebuild widget triples for each restored slot.
+      // Rebuild widget triples (with their non-serializing header labels)
+      // for each restored slot.
       for (let slot_number_being_rebuilt = 1; slot_number_being_rebuilt <= restored_conditioning_slot_count_from_saved_inputs; slot_number_being_rebuilt++) {
+        addOneSlotHeaderLabelWidget(this, slot_number_being_rebuilt);
         addOneWidgetTripleForSlot(this, slot_number_being_rebuilt);
       }
 

@@ -17,7 +17,7 @@ class DebugConditioning:
         return {
             "required": {
                 "conditioning": ("CONDITIONING",),
-                "label": ("STRING", {"default": "conditioning"}),
+                "label": ("STRING", {"default": ""}),
             }
         }
 
@@ -25,6 +25,7 @@ class DebugConditioning:
     RETURN_NAMES = ("conditioning",)
     FUNCTION = "debug"
     CATEGORY = "advanced/conditioning"
+    OUTPUT_NODE = True
 
     def debug(self, conditioning, label):
         print("\n" + "=" * 80)
