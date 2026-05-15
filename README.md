@@ -184,6 +184,45 @@ Useful for verifying that `start_percent` / `end_percent` / `pooled_output` /
 
 ---
 
+## CLIPTextEncodeSDXL (auto-split-and-merge)
+
+A drop-in extension of stock `CLIPTextEncodeSDXL`. When a prompt is longer
+than 77 tokens, the CLIP tokenizer splits it into multiple chunks. This node
+adds two dropdowns controlling what happens with those chunks per stream:
+
+- **split_and_merge_g** (CLIP-G stream): `truncate` / `combine` / `average`
+- **split_and_merge_l** (CLIP-L stream): `truncate` / `combine` / `average`
+
+Modes:
+- `truncate` (default) — keep only the first 77-token chunk for that stream.
+  Both streams at `truncate` reproduces stock `CLIPTextEncodeSDXL` behavior
+  (modulo the difference that stock concatenates chunks along seq dim,
+  whereas truncate here actually drops overflow).
+- `combine` — keep all chunks; each becomes a separate CONDITIONING entry
+  (parallel branches the sampler handles independently).
+- `average` — encode each chunk separately, then blend token tensors and
+  pooled outputs into a single CONDITIONING entry.
+
+The two dropdowns are independent. Output reduction:
+- If either stream is `combine` → multi-entry CONDITIONING.
+- Else if either is `average` → single-entry averaged CONDITIONING.
+- Else (both `truncate`) → single-entry truncated CONDITIONING.
+
+Both streams are encoded in paired chunks; if one stream has fewer chunks
+than the other, the shorter one is padded with empty-text chunks per the
+same padding logic stock `CLIPTextEncodeSDXL` uses.
+
+Inputs and size-conditioning fields (`width`, `height`, `crop_w/h`,
+`target_width/height`) are identical to stock.
+
+Outputs:
+- `conditioning` (CONDITIONING)
+- `debug_info` (STRING) — names chunk counts, modes, paired-encode count,
+  and reduction strategy. Wire into a ShowText node to see at a glance how
+  the merge happened.
+
+---
+
 ## License
 
 MIT — see `LICENSE`.
