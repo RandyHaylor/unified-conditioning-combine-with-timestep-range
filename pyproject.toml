@@ -1,0 +1,16 @@
+[project]
+name = "unified-conditioning-merge"
+description = "ComfyUI custom node: range-aware Concat/Combine/Average for CONDITIONING that correctly carries start_percent/end_percent across both inputs. Single unified node with mode dropdown, dynamic 1..N input slots, per-slot weights, and timestep-range intersection."
+version = "0.2.0"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.urls]
+Repository = "https://github.com/RandyHaylor/unified-conditioning-combine-with-timestep-range"
+Issues = "https://github.com/RandyHaylor/unified-conditioning-combine-with-timestep-range/issues"
+
+[tool.comfy]
+PublisherId = "randyhaylor"
+DisplayName = "Unified Conditioning Merge (with timestep ranges)"
+Icon = ""
