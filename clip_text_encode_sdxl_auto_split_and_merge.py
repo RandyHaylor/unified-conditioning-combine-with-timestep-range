@@ -405,17 +405,23 @@ def _pad_two_chunk_lists_to_matching_length_with_empty_chunks(
     return chunks_list_for_g_stream, chunks_list_for_l_stream
 
 
-def _encode_in_concat_pipeline_returning_single_cond_entry(
+def _encode_in_concat_pipeline_returning_single_cond_entry_and_diagnostics(
     g_mode, l_mode, text_g, text_l, clip, sdxl_size_conditioning_add_dict
 ):
     """
     Stock-style pipeline: build the chunk lists for both streams per their
     mode, pad to matching length, and call encode_from_tokens_scheduled
-    ONCE with the full multi-chunk tokens dict. Returns one CONDITIONING
-    entry with token tensor shape (1, 77*N, 2048) for N chunks.
-
-    Used only when pipeline priority resolves to concat (i.e., neither
-    stream is combine or average).
+    ONCE with the full multi-chunk tokens dict. Returns:
+        (conditioning, diagnostics_dict)
+    where diagnostics_dict has keys:
+        - chunk_count_for_g_before_pad
+        - chunk_count_for_l_before_pad
+        - chunk_count_after_padding
+        - break_segment_count_for_g
+        - break_segment_count_for_l
+        - g_content_token_count
+        - l_content_token_count
+        - encoded_token_sequence_length
     """
     if g_mode == SPLIT_AND_MERGE_MODE_TRUNCATE:
         g_chunks = clip.tokenize(text_g)["g"][:1]
@@ -427,13 +433,77 @@ def _encode_in_concat_pipeline_returning_single_cond_entry(
     else:  # concat
         l_chunks = _tokenize_text_respecting_break_markers_returning_all_chunks_flat(text_l, clip, "l")
 
+    chunk_count_for_g_before_pad = len(g_chunks)
+    chunk_count_for_l_before_pad = len(l_chunks)
+
     g_chunks, l_chunks = _pad_two_chunk_lists_to_matching_length_with_empty_chunks(g_chunks, l_chunks, clip)
+    chunk_count_after_padding = len(g_chunks)
 
     tokens_for_single_encode_call = {"g": g_chunks, "l": l_chunks}
     encoded_conditioning_with_all_chunks_concatenated_along_seq_dim = clip.encode_from_tokens_scheduled(
         tokens_for_single_encode_call, add_dict=sdxl_size_conditioning_add_dict
     )
-    return encoded_conditioning_with_all_chunks_concatenated_along_seq_dim
+
+    encoded_token_sequence_length = None
+    if (
+        encoded_conditioning_with_all_chunks_concatenated_along_seq_dim
+        and len(encoded_conditioning_with_all_chunks_concatenated_along_seq_dim) > 0
+    ):
+        first_entry_tokens_tensor = encoded_conditioning_with_all_chunks_concatenated_along_seq_dim[0][0]
+        if hasattr(first_entry_tokens_tensor, "shape") and len(first_entry_tokens_tensor.shape) >= 2:
+            encoded_token_sequence_length = int(first_entry_tokens_tensor.shape[1])
+
+    break_segment_count_for_g = len(
+        [seg for seg in _split_text_at_break_markers_into_hard_segments(text_g) if seg]
+    )
+    break_segment_count_for_l = len(
+        [seg for seg in _split_text_at_break_markers_into_hard_segments(text_l) if seg]
+    )
+    g_content_token_count = _count_content_tokens_in_text_using_clip_tokenizer(text_g, clip, "g")
+    l_content_token_count = _count_content_tokens_in_text_using_clip_tokenizer(text_l, clip, "l")
+
+    diagnostics_dict_for_caller = {
+        "chunk_count_for_g_before_pad": chunk_count_for_g_before_pad,
+        "chunk_count_for_l_before_pad": chunk_count_for_l_before_pad,
+        "chunk_count_after_padding": chunk_count_after_padding,
+        "break_segment_count_for_g": break_segment_count_for_g,
+        "break_segment_count_for_l": break_segment_count_for_l,
+        "g_content_token_count": g_content_token_count,
+        "l_content_token_count": l_content_token_count,
+        "encoded_token_sequence_length": encoded_token_sequence_length,
+    }
+    return (
+        encoded_conditioning_with_all_chunks_concatenated_along_seq_dim,
+        diagnostics_dict_for_caller,
+    )
+
+
+def _build_concat_or_truncate_pipeline_debug_info_string(
+    active_pipeline_label,
+    g_mode,
+    l_mode,
+    diagnostics_dict,
+    output_reduction_strategy_label,
+    final_conditioning_entry_count,
+):
+    return (
+        "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
+        f"  active pipeline: {active_pipeline_label}\n"
+        f"  split_and_merge_g: {g_mode}\n"
+        f"  split_and_merge_l: {l_mode}\n"
+        f"  text_g content tokens: {diagnostics_dict['g_content_token_count']}\n"
+        f"  text_l content tokens: {diagnostics_dict['l_content_token_count']}\n"
+        f"  BREAK segments (g/l): "
+        f"{diagnostics_dict['break_segment_count_for_g']} / "
+        f"{diagnostics_dict['break_segment_count_for_l']}\n"
+        f"  77-token chunks from tokenizer (g/l before padding): "
+        f"{diagnostics_dict['chunk_count_for_g_before_pad']} / "
+        f"{diagnostics_dict['chunk_count_for_l_before_pad']}\n"
+        f"  77-token chunks after pad-to-match: {diagnostics_dict['chunk_count_after_padding']}\n"
+        f"  encoded token sequence length: {diagnostics_dict['encoded_token_sequence_length']}\n"
+        f"  output reduction strategy: {output_reduction_strategy_label}\n"
+        f"  final CONDITIONING entry count: {final_conditioning_entry_count}"
+    )
 
 
 def _determine_active_pipeline_from_mode_pair(g_mode, l_mode):
@@ -568,38 +638,42 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
 
         # ---- CONCAT pipeline: stock-style multi-chunk single-encode-call ----
         if active_pipeline_for_this_invocation == SPLIT_AND_MERGE_MODE_CONCAT:
-            output_conditioning_list = _encode_in_concat_pipeline_returning_single_cond_entry(
-                split_and_merge_g, split_and_merge_l, text_g, text_l, clip, sdxl_size_conditioning_add_dict
+            output_conditioning_list, concat_pipeline_diagnostics_dict = (
+                _encode_in_concat_pipeline_returning_single_cond_entry_and_diagnostics(
+                    split_and_merge_g, split_and_merge_l, text_g, text_l, clip, sdxl_size_conditioning_add_dict
+                )
             )
             output_reduction_strategy_label = "concat (stock-style seq-dim concat across all chunks)"
-            debug_info_string = (
-                "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
-                f"  active pipeline: {active_pipeline_for_this_invocation}\n"
-                f"  split_and_merge_g: {split_and_merge_g}\n"
-                f"  split_and_merge_l: {split_and_merge_l}\n"
-                f"  output reduction strategy: {output_reduction_strategy_label}\n"
-                f"  final CONDITIONING entry count: {len(output_conditioning_list)}"
+            debug_info_string = _build_concat_or_truncate_pipeline_debug_info_string(
+                active_pipeline_for_this_invocation,
+                split_and_merge_g,
+                split_and_merge_l,
+                concat_pipeline_diagnostics_dict,
+                output_reduction_strategy_label,
+                len(output_conditioning_list),
             )
             return (output_conditioning_list, debug_info_string)
 
         # ---- TRUNCATE pipeline: drop overflow on both sides, single encode ----
         if active_pipeline_for_this_invocation == SPLIT_AND_MERGE_MODE_TRUNCATE:
-            output_conditioning_list = _encode_in_concat_pipeline_returning_single_cond_entry(
-                SPLIT_AND_MERGE_MODE_TRUNCATE,
-                SPLIT_AND_MERGE_MODE_TRUNCATE,
-                text_g,
-                text_l,
-                clip,
-                sdxl_size_conditioning_add_dict,
+            output_conditioning_list, truncate_pipeline_diagnostics_dict = (
+                _encode_in_concat_pipeline_returning_single_cond_entry_and_diagnostics(
+                    SPLIT_AND_MERGE_MODE_TRUNCATE,
+                    SPLIT_AND_MERGE_MODE_TRUNCATE,
+                    text_g,
+                    text_l,
+                    clip,
+                    sdxl_size_conditioning_add_dict,
+                )
             )
             output_reduction_strategy_label = "truncate (first chunk only, both streams)"
-            debug_info_string = (
-                "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
-                f"  active pipeline: {active_pipeline_for_this_invocation}\n"
-                f"  split_and_merge_g: {split_and_merge_g}\n"
-                f"  split_and_merge_l: {split_and_merge_l}\n"
-                f"  output reduction strategy: {output_reduction_strategy_label}\n"
-                f"  final CONDITIONING entry count: {len(output_conditioning_list)}"
+            debug_info_string = _build_concat_or_truncate_pipeline_debug_info_string(
+                active_pipeline_for_this_invocation,
+                split_and_merge_g,
+                split_and_merge_l,
+                truncate_pipeline_diagnostics_dict,
+                output_reduction_strategy_label,
+                len(output_conditioning_list),
             )
             return (output_conditioning_list, debug_info_string)
 
