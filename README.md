@@ -14,7 +14,8 @@ This pack ships:
 - **CLIPTextEncodeSDXL (auto-split-and-merge)** — drop-in extension of
   stock SDXL text encoder with smart splitting at `BREAK` / comma / line /
   whitespace boundaries when a prompt exceeds 77 tokens. Per-stream
-  truncate / combine / average dropdowns.
+  concat / truncate / combine / average dropdowns (default concat — matches
+  stock SDXL encoder's long-prompt handling).
 - **Conditioning-crop-zoom-SDXL** — rewrites SDXL size/crop conditioning
   metadata using the latent's actual W/H plus a zoom factor and offset.
   Recommended as the FINAL stop on both positive and negative
@@ -198,8 +199,20 @@ A drop-in extension of stock `CLIPTextEncodeSDXL` with smart pre-tokenize
 splitting AND two dropdowns controlling what to do with the resulting
 chunks per stream:
 
-- **split_and_merge_g** (CLIP-G stream): `truncate` / `combine` / `average`
-- **split_and_merge_l** (CLIP-L stream): `truncate` / `combine` / `average`
+- **split_and_merge_g** (CLIP-G stream): `concat` / `truncate` / `combine` / `average`
+- **split_and_merge_l** (CLIP-L stream): `concat` / `truncate` / `combine` / `average`
+
+Default for both is `concat` — reproduces stock SDXL encoder's "encode every
+chunk in one call, concat outputs along the sequence dim" behavior. Pick a
+non-default mode only when you want a specific deviation from stock.
+
+The pipeline that runs is determined by the highest-priority mode across
+both streams, in this order: **combine > average > concat > truncate**. So
+if either side picks `combine`, the combine pipeline runs and produces a
+multi-entry output. If either picks `average` (and neither picks combine),
+the result is a single blended entry. If both pick `concat`, the stock-style
+single-encode pipeline runs. If both pick `truncate`, only the first chunk
+pair encodes (overflow dropped).
 
 ### How the splitting works
 
@@ -221,24 +234,39 @@ splits at the highest-priority delimiter where every resulting piece fits,
 then greedy-bin-packs the pieces into K bins targeting equal token counts.
 Result: chunks are roughly the same size — no tiny over-weighted tail.
 
-### Per-mode behavior (post-splitting)
+### Per-mode behavior
 
-- `truncate` (default) — keep only the FIRST balanced text piece.
-- `combine` — each piece becomes a separate CONDITIONING entry (parallel
-  branches the sampler handles independently).
-- `average` — encode each piece, then blend the resulting token tensors
-  and pooled outputs into a single CONDITIONING entry.
+- `concat` (default) — feeds all tokenized chunks (respecting BREAK as a
+  forced chunk boundary) to one encode call, returning one CONDITIONING
+  entry whose token sequence is `77 * N` long. Matches stock SDXL encoder.
+  **No balanced sub-splitting** — uses the tokenizer's natural greedy
+  chunking so chunk-padding patterns match what the model was trained on.
+- `truncate` — drop overflow; keep only the FIRST 77-token chunk for that
+  stream.
+- `combine` — sub-split text into balanced pieces (BREAK-respecting +
+  balanced via comma/line/space cascade); each piece becomes a separate
+  CONDITIONING entry (parallel branches the sampler handles independently).
+- `average` — sub-split text into balanced pieces; encode each piece, then
+  blend the resulting token tensors and pooled outputs into a single
+  CONDITIONING entry.
 
-### Output reduction
+### Pipeline priority (when g and l pick different modes)
 
-The two dropdowns are independent. Final output multiplicity:
-- If either stream is `combine` → multi-entry CONDITIONING.
-- Else if either is `average` → single-entry averaged CONDITIONING.
-- Else (both `truncate`) → single-entry truncated CONDITIONING.
+The two dropdowns are independent; if they disagree, the **higher-priority**
+mode wins and dictates the pipeline that runs:
 
-Both streams encode in paired pieces; if one stream's split produces fewer
-pieces than the other, the shorter side is padded with empty text per stock
-`CLIPTextEncodeSDXL`'s shorter-side-pad logic.
+**combine > average > concat > truncate**
+
+So with `g=combine, l=concat`, the combine pipeline runs (per-piece encode,
+multi-entry output). With `g=concat, l=average`, the average pipeline runs.
+With both `concat`, the stock-style pipeline runs. With both `truncate`,
+only the first chunk pair encodes.
+
+### Padding for stream length mismatches
+
+Within any pipeline, if one stream produces fewer chunks/pieces than the
+other, the shorter side is padded with empty chunks (matches stock
+`CLIPTextEncodeSDXL`'s pad-shorter-side logic).
 
 ### Inputs
 

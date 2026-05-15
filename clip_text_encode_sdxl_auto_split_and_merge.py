@@ -6,8 +6,19 @@ what happens when a prompt exceeds 77 tokens AND with smart pre-tokenize
 splitting at BREAK / comma / line / space boundaries so chunk sizes stay
 balanced (no tiny over-weighted tail chunks).
 
-    split_and_merge_g   ∈ {truncate, combine, average}     (CLIP-G stream)
-    split_and_merge_l   ∈ {truncate, combine, average}     (CLIP-L stream)
+    split_and_merge_g   ∈ {concat, truncate, combine, average}    (CLIP-G)
+    split_and_merge_l   ∈ {concat, truncate, combine, average}    (CLIP-L)
+
+Default for both is `concat`. The pipeline that runs is determined by the
+highest-priority mode across both streams, in this order (highest first):
+
+    combine > average > concat > truncate
+
+So if either stream picks combine, the combine pipeline runs (multi-entry
+output). If either picks average, the average pipeline runs (single
+blended entry). If both pick concat, the concat pipeline runs (stock-style
+single encode call with all chunks, seq-dim concat). If both pick truncate,
+only first chunks are encoded.
 
 Split markers, highest priority first:
     BREAK         — capitalized whole word; same convention as A1111/Forge.
@@ -54,14 +65,33 @@ import torch
 import nodes
 
 
+SPLIT_AND_MERGE_MODE_CONCAT = "concat"
 SPLIT_AND_MERGE_MODE_TRUNCATE = "truncate"
 SPLIT_AND_MERGE_MODE_COMBINE = "combine"
 SPLIT_AND_MERGE_MODE_AVERAGE = "average"
 
+# Dropdown order. `concat` is first → default. It reproduces stock
+# CLIPTextEncodeSDXL's "encode every chunk in one call, concat the resulting
+# 77-token outputs along the sequence dim" behavior, while still respecting
+# BREAK markers as forced chunk boundaries.
 SPLIT_AND_MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER = [
+    SPLIT_AND_MERGE_MODE_CONCAT,
     SPLIT_AND_MERGE_MODE_TRUNCATE,
     SPLIT_AND_MERGE_MODE_COMBINE,
     SPLIT_AND_MERGE_MODE_AVERAGE,
+]
+
+# Highest-priority mode determines which encoding pipeline the node runs.
+# combine > average > concat > truncate. When both streams are concat, we
+# use the stock-style pipeline (one encode call, multi-chunk tokens, one
+# cond out). When either is combine or average, we use the per-piece
+# pipeline (one encode call per piece pair, then either keep multiple
+# entries or average them into one).
+SPLIT_AND_MERGE_MODE_PIPELINE_PRIORITY_ORDER_HIGHEST_FIRST = [
+    SPLIT_AND_MERGE_MODE_COMBINE,
+    SPLIT_AND_MERGE_MODE_AVERAGE,
+    SPLIT_AND_MERGE_MODE_CONCAT,
+    SPLIT_AND_MERGE_MODE_TRUNCATE,
 ]
 
 # Each CLIP-77-token chunk has start + end + content + padding. Real content
@@ -332,6 +362,92 @@ def _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(t
     return final_text_pieces_ready_to_tokenize
 
 
+# -------------- concat-pipeline helpers (stock-style multi-chunk encode) --------------
+
+def _tokenize_text_respecting_break_markers_returning_all_chunks_flat(text, clip, stream_key):
+    """
+    Returns a flat list of CLIP-77-token chunks for `text` on the given
+    stream, splitting at BREAK markers so each BREAK forces a new chunk
+    boundary. Within each BREAK-segment the CLIP tokenizer's natural greedy
+    chunking is used (no balancing — concat mode matches stock behavior).
+
+    If the input text is empty or whitespace-only, returns a single empty
+    chunk (the tokenizer's empty-text chunk for this stream).
+    """
+    if not text or not text.strip():
+        empty_chunks_dict = clip.tokenize("")
+        return list(empty_chunks_dict[stream_key])
+
+    hard_segments_separated_by_break_markers = _split_text_at_break_markers_into_hard_segments(text)
+
+    flat_chunks_list_concatenated_across_all_segments = []
+    for segment_text in hard_segments_separated_by_break_markers:
+        if not segment_text:
+            continue
+        per_segment_chunks_dict = clip.tokenize(segment_text)
+        flat_chunks_list_concatenated_across_all_segments.extend(per_segment_chunks_dict[stream_key])
+
+    if not flat_chunks_list_concatenated_across_all_segments:
+        empty_chunks_dict = clip.tokenize("")
+        return list(empty_chunks_dict[stream_key])
+    return flat_chunks_list_concatenated_across_all_segments
+
+
+def _pad_two_chunk_lists_to_matching_length_with_empty_chunks(
+    chunks_list_for_g_stream, chunks_list_for_l_stream, clip
+):
+    """Stock-style pad-shorter-with-empty so g and l have the same chunk count."""
+    empty_tokens_dict = clip.tokenize("")
+    while len(chunks_list_for_g_stream) < len(chunks_list_for_l_stream):
+        chunks_list_for_g_stream.append(empty_tokens_dict["g"][0])
+    while len(chunks_list_for_l_stream) < len(chunks_list_for_g_stream):
+        chunks_list_for_l_stream.append(empty_tokens_dict["l"][0])
+    return chunks_list_for_g_stream, chunks_list_for_l_stream
+
+
+def _encode_in_concat_pipeline_returning_single_cond_entry(
+    g_mode, l_mode, text_g, text_l, clip, sdxl_size_conditioning_add_dict
+):
+    """
+    Stock-style pipeline: build the chunk lists for both streams per their
+    mode, pad to matching length, and call encode_from_tokens_scheduled
+    ONCE with the full multi-chunk tokens dict. Returns one CONDITIONING
+    entry with token tensor shape (1, 77*N, 2048) for N chunks.
+
+    Used only when pipeline priority resolves to concat (i.e., neither
+    stream is combine or average).
+    """
+    if g_mode == SPLIT_AND_MERGE_MODE_TRUNCATE:
+        g_chunks = clip.tokenize(text_g)["g"][:1]
+    else:  # concat
+        g_chunks = _tokenize_text_respecting_break_markers_returning_all_chunks_flat(text_g, clip, "g")
+
+    if l_mode == SPLIT_AND_MERGE_MODE_TRUNCATE:
+        l_chunks = clip.tokenize(text_l)["l"][:1]
+    else:  # concat
+        l_chunks = _tokenize_text_respecting_break_markers_returning_all_chunks_flat(text_l, clip, "l")
+
+    g_chunks, l_chunks = _pad_two_chunk_lists_to_matching_length_with_empty_chunks(g_chunks, l_chunks, clip)
+
+    tokens_for_single_encode_call = {"g": g_chunks, "l": l_chunks}
+    encoded_conditioning_with_all_chunks_concatenated_along_seq_dim = clip.encode_from_tokens_scheduled(
+        tokens_for_single_encode_call, add_dict=sdxl_size_conditioning_add_dict
+    )
+    return encoded_conditioning_with_all_chunks_concatenated_along_seq_dim
+
+
+def _determine_active_pipeline_from_mode_pair(g_mode, l_mode):
+    """
+    Returns the merge-mode label of the pipeline that should run for the
+    given (g_mode, l_mode) pair, per the priority order
+    combine > average > concat > truncate.
+    """
+    for priority_mode_label in SPLIT_AND_MERGE_MODE_PIPELINE_PRIORITY_ORDER_HIGHEST_FIRST:
+        if g_mode == priority_mode_label or l_mode == priority_mode_label:
+            return priority_mode_label
+    return SPLIT_AND_MERGE_MODE_TRUNCATE
+
+
 # -------------- pair encoding helpers --------------
 
 def _pad_token_chunks_dict_g_and_l_to_matching_length(tokens_dict, clip):
@@ -409,11 +525,11 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
                 "text_l": ("STRING", {"multiline": True, "dynamicPrompts": True}),
                 "split_and_merge_g": (
                     SPLIT_AND_MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER,
-                    {"default": SPLIT_AND_MERGE_MODE_TRUNCATE},
+                    {"default": SPLIT_AND_MERGE_MODE_CONCAT},
                 ),
                 "split_and_merge_l": (
                     SPLIT_AND_MERGE_MODE_CHOICES_IN_DROPDOWN_ORDER,
-                    {"default": SPLIT_AND_MERGE_MODE_TRUNCATE},
+                    {"default": SPLIT_AND_MERGE_MODE_CONCAT},
                 ),
             }
         }
@@ -437,6 +553,57 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
         split_and_merge_g,
         split_and_merge_l,
     ):
+        sdxl_size_conditioning_add_dict = {
+            "width": width,
+            "height": height,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+            "target_width": target_width,
+            "target_height": target_height,
+        }
+
+        active_pipeline_for_this_invocation = _determine_active_pipeline_from_mode_pair(
+            split_and_merge_g, split_and_merge_l
+        )
+
+        # ---- CONCAT pipeline: stock-style multi-chunk single-encode-call ----
+        if active_pipeline_for_this_invocation == SPLIT_AND_MERGE_MODE_CONCAT:
+            output_conditioning_list = _encode_in_concat_pipeline_returning_single_cond_entry(
+                split_and_merge_g, split_and_merge_l, text_g, text_l, clip, sdxl_size_conditioning_add_dict
+            )
+            output_reduction_strategy_label = "concat (stock-style seq-dim concat across all chunks)"
+            debug_info_string = (
+                "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
+                f"  active pipeline: {active_pipeline_for_this_invocation}\n"
+                f"  split_and_merge_g: {split_and_merge_g}\n"
+                f"  split_and_merge_l: {split_and_merge_l}\n"
+                f"  output reduction strategy: {output_reduction_strategy_label}\n"
+                f"  final CONDITIONING entry count: {len(output_conditioning_list)}"
+            )
+            return (output_conditioning_list, debug_info_string)
+
+        # ---- TRUNCATE pipeline: drop overflow on both sides, single encode ----
+        if active_pipeline_for_this_invocation == SPLIT_AND_MERGE_MODE_TRUNCATE:
+            output_conditioning_list = _encode_in_concat_pipeline_returning_single_cond_entry(
+                SPLIT_AND_MERGE_MODE_TRUNCATE,
+                SPLIT_AND_MERGE_MODE_TRUNCATE,
+                text_g,
+                text_l,
+                clip,
+                sdxl_size_conditioning_add_dict,
+            )
+            output_reduction_strategy_label = "truncate (first chunk only, both streams)"
+            debug_info_string = (
+                "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
+                f"  active pipeline: {active_pipeline_for_this_invocation}\n"
+                f"  split_and_merge_g: {split_and_merge_g}\n"
+                f"  split_and_merge_l: {split_and_merge_l}\n"
+                f"  output reduction strategy: {output_reduction_strategy_label}\n"
+                f"  final CONDITIONING entry count: {len(output_conditioning_list)}"
+            )
+            return (output_conditioning_list, debug_info_string)
+
+        # ---- COMBINE or AVERAGE pipeline: per-piece balanced split + per-pair encode ----
         text_pieces_for_g_stream = _split_full_text_into_balanced_chunk_sized_pieces_respecting_break_markers(
             text_g, clip, "g"
         )
@@ -446,6 +613,9 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
         initial_piece_count_for_g = len(text_pieces_for_g_stream)
         initial_piece_count_for_l = len(text_pieces_for_l_stream)
 
+        # truncate on a stream reduces that side to first balanced piece.
+        # concat on a stream in this pipeline keeps all balanced pieces (we're
+        # in combine/average pipeline because the OTHER side picked that).
         if split_and_merge_g == SPLIT_AND_MERGE_MODE_TRUNCATE and len(text_pieces_for_g_stream) > 0:
             text_pieces_for_g_stream = text_pieces_for_g_stream[:1]
         if split_and_merge_l == SPLIT_AND_MERGE_MODE_TRUNCATE and len(text_pieces_for_l_stream) > 0:
@@ -456,15 +626,6 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
             text_pieces_for_g_stream.append("")
         while len(text_pieces_for_l_stream) < paired_piece_count_to_encode:
             text_pieces_for_l_stream.append("")
-
-        sdxl_size_conditioning_add_dict = {
-            "width": width,
-            "height": height,
-            "crop_w": crop_w,
-            "crop_h": crop_h,
-            "target_width": target_width,
-            "target_height": target_height,
-        }
 
         per_paired_piece_conditioning_list = []
         per_paired_piece_token_count_summary_lines = []
@@ -481,32 +642,21 @@ class CLIPTextEncodeSDXLAutoSplitAndMerge:
                 f"l_tokens={_count_content_tokens_in_text_using_clip_tokenizer(current_text_piece_l, clip, 'l')}"
             )
 
-        any_stream_is_combine_mode = (
-            split_and_merge_g == SPLIT_AND_MERGE_MODE_COMBINE
-            or split_and_merge_l == SPLIT_AND_MERGE_MODE_COMBINE
-        )
-        any_stream_is_average_mode = (
-            split_and_merge_g == SPLIT_AND_MERGE_MODE_AVERAGE
-            or split_and_merge_l == SPLIT_AND_MERGE_MODE_AVERAGE
-        )
-
-        if any_stream_is_combine_mode:
+        if active_pipeline_for_this_invocation == SPLIT_AND_MERGE_MODE_COMBINE:
             output_conditioning_list = []
             for per_pair_conditioning in per_paired_piece_conditioning_list:
                 output_conditioning_list.extend(per_pair_conditioning)
-            output_reduction_strategy_label = "combine"
-        elif any_stream_is_average_mode:
+            output_reduction_strategy_label = "combine (parallel branches)"
+        else:  # AVERAGE
             averaged_single_entry = _average_per_chunk_conditionings_into_a_single_conditioning_entry(
                 per_paired_piece_conditioning_list
             )
             output_conditioning_list = [averaged_single_entry]
-            output_reduction_strategy_label = "average"
-        else:
-            output_conditioning_list = per_paired_piece_conditioning_list[0]
-            output_reduction_strategy_label = "truncate (first piece only)"
+            output_reduction_strategy_label = "average (blended embeddings)"
 
         debug_info_string = (
             "CLIPTextEncodeSDXL (auto-split-and-merge):\n"
+            f"  active pipeline: {active_pipeline_for_this_invocation}\n"
             f"  text_g balanced piece count: {initial_piece_count_for_g}\n"
             f"  text_l balanced piece count: {initial_piece_count_for_l}\n"
             f"  split_and_merge_g: {split_and_merge_g}\n"
