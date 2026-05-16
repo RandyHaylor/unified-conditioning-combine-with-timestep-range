@@ -56,11 +56,33 @@ function toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(node, wi
   if (should_be_visible) {
     widget_to_toggle.type = cached_original_props_for_this_widget.original_type;
     widget_to_toggle.computeSize = cached_original_props_for_this_widget.original_compute_size_function;
+    widget_to_toggle.hidden = false;
+    // Also unhide any DOM companion (textarea for STRING multiline, etc.)
+    if (widget_to_toggle.element && widget_to_toggle.element.style) {
+      widget_to_toggle.element.style.display = "";
+    }
+    if (widget_to_toggle.inputEl && widget_to_toggle.inputEl.style) {
+      widget_to_toggle.inputEl.style.display = "";
+    }
   } else {
     widget_to_toggle.type = HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX + widget_to_toggle.name;
     widget_to_toggle.computeSize = function () {
       return [0, -4];
     };
+    // CRITICAL: also set widget.hidden=true. Verified empirically (via Playwright
+    // inspection of section_16_weight) that LiteGraph's canvas widget renderer
+    // for FLOAT/INT/COMBO widgets respects this flag — the type+computeSize
+    // override alone hides STRING multiline (DOM-rendered) but does NOT hide
+    // the LAST canvas FLOAT widget in the array.
+    widget_to_toggle.hidden = true;
+    // Also hide DOM companion if any (defensive — verified that STRING
+    // multiline widgets have BOTH .element and .inputEl as <textarea>).
+    if (widget_to_toggle.element && widget_to_toggle.element.style) {
+      widget_to_toggle.element.style.display = "none";
+    }
+    if (widget_to_toggle.inputEl && widget_to_toggle.inputEl.style) {
+      widget_to_toggle.inputEl.style.display = "none";
+    }
   }
 
   // On show: grow the node to fit the now-visible widgets. On hide: keep
