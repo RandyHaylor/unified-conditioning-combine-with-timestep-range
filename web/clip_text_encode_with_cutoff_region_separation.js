@@ -25,6 +25,10 @@ const SECTION_TEXT_WIDGET_NAME_REGEX = /^section_(\d+)_text$/;
 const SECTION_HEADER_WIDGET_NAME_PREFIX = "__section_header_for_index_";
 const SECTION_HEADER_WIDGET_NAME_REGEX = /^__section_header_for_index_(\d+)$/;
 
+const ZOOM_GROUP_HEADER_WIDGET_NAME = "__zoom_group_header_static";
+const ZOOM_GROUP_HEADER_DISPLAY_LABEL_TEXT = "── zoom effect based on SDXL CLIP source, target image settings ──";
+const ZOOM_WIDGET_NAME_TO_INSERT_HEADER_BEFORE = "zoom";
+
 const HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX = "cutoffSectionsHidden:";
 
 // One global cache keyed by widget.name. The widget objects themselves get
@@ -79,6 +83,42 @@ function ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(node) 
     // Skip past the newly-inserted header AND the text widget that follows.
     widget_index_iterator_position += 2;
   }
+}
+
+function ensureStaticZoomGroupHeaderWidgetIsInsertedBeforeTheZoomWidget(node) {
+  if (!node.widgets) return;
+  // Idempotent: bail if header already in place.
+  const existing_header_index = node.widgets.findIndex(
+    (w) => w && w.name === ZOOM_GROUP_HEADER_WIDGET_NAME,
+  );
+  if (existing_header_index >= 0) return;
+  // Find the zoom widget's current array position.
+  const zoom_widget_index = node.widgets.findIndex(
+    (w) => w && w.name === ZOOM_WIDGET_NAME_TO_INSERT_HEADER_BEFORE,
+  );
+  if (zoom_widget_index < 0) return;
+  const zoom_group_header_widget_to_insert = {
+    name: ZOOM_GROUP_HEADER_WIDGET_NAME,
+    type: "custom",
+    value: "",
+    options: { serialize: false },
+    draw(canvas_context, owning_node, widget_width_pixels, y_top_pixels, widget_height_pixels) {
+      canvas_context.save();
+      canvas_context.fillStyle = "#9aa";
+      canvas_context.font = "bold 11px Arial, sans-serif";
+      canvas_context.textBaseline = "middle";
+      canvas_context.fillText(
+        ZOOM_GROUP_HEADER_DISPLAY_LABEL_TEXT,
+        12,
+        y_top_pixels + widget_height_pixels / 2,
+      );
+      canvas_context.restore();
+    },
+    computeSize(available_widget_width_pixels) {
+      return [available_widget_width_pixels, 16];
+    },
+  };
+  node.widgets.splice(zoom_widget_index, 0, zoom_group_header_widget_to_insert);
 }
 
 function findWidgetByNameOnNodeOrUndefined(node, widget_name_to_find) {
@@ -223,12 +263,14 @@ app.registerExtension({
         };
       }
 
+      ensureStaticZoomGroupHeaderWidgetIsInsertedBeforeTheZoomWidget(this);
       ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(this);
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       // DOM elements may be inserted asynchronously after onNodeCreated.
       // A deferred second pass catches that case.
       const node_reference_for_deferred_update = this;
       setTimeout(function () {
+        ensureStaticZoomGroupHeaderWidgetIsInsertedBeforeTheZoomWidget(node_reference_for_deferred_update);
         ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(node_reference_for_deferred_update);
         updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node_reference_for_deferred_update);
       }, 0);
@@ -249,6 +291,7 @@ app.registerExtension({
           delete original_widget_props_cache_by_widget_name[widget_descriptor.name];
         }
       }
+      ensureStaticZoomGroupHeaderWidgetIsInsertedBeforeTheZoomWidget(this);
       ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(this);
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       return original_on_configure_return_value;
