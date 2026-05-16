@@ -20,6 +20,11 @@ This pack ships:
   metadata using the latent's actual W/H plus a zoom factor and offset.
   Recommended as the FINAL stop on both positive and negative
   conditioning before the sampler (see its section below).
+- **Conditioning Cutoff Sections Prompt** — single-node prompt builder
+  with a `section_count` you can expand/collapse manually. Each section
+  has a text field and an `isolate` toggle that uses the Cutoff algorithm
+  to confine that section's influence to its own tokens (prevents prompt
+  context bleeding). Requires the ComfyUI_Cutoff plugin.
 - **Debug Conditioning** — in-line passthrough that prints CONDITIONING
   structure to the server console and emits a STRING dump output.
 
@@ -347,6 +352,66 @@ the sampler's `positive` and `negative` inputs respectively. Two reasons:
 Setting it to default (`zoom=1.0, offsets=0`) is already an improvement
 over not using it at all, because it pins target/source to your real
 latent size on BOTH pos and neg in one node.
+
+---
+
+## Conditioning Cutoff Sections Prompt
+
+A single-node prompt builder built on top of BlenderNeko's
+[ComfyUI_Cutoff](https://github.com/BlenderNeko/ComfyUI_Cutoff). The Cutoff
+algorithm prevents prompt context bleeding by measuring each phrase's
+influence on the global CLIP embedding, then confining that influence back
+to the phrase's own tokens. Read the linked README for the underlying
+theory.
+
+**This node requires ComfyUI_Cutoff to be installed.** Without it, the node
+raises a clear runtime error pointing you to the install link.
+
+### UI
+
+- `clip` (CLIP) — the CLIP model to encode through.
+- `section_count` (INT 1..16, default 3) — how many section pairs are
+  active. Section widgets with index > section_count are hidden in the UI
+  (their values still persist in the workflow JSON, so you can re-expand
+  without losing typed text).
+- `join_separator` (STRING, default `"\n"`) — how the active sections are
+  joined into the full prompt text that CLIP sees. `\n` matches Cutoff's
+  natural per-line region convention.
+- `mask_token` (STRING, default `""`) — passed through to Cutoff's finalize.
+- `strict_mask` (FLOAT 0..1, default `1.0`) — Cutoff strictness.
+  `1.0` = each isolated phrase only affects its own region;
+  `0.0` = phrases can still affect outside specified areas.
+- `start_from_masked` (FLOAT 0..1, default `1.0`) — passed through to
+  Cutoff's finalize.
+- `section_N_text` (STRING multiline) — this section's prompt text.
+- `section_N_isolate` (BOOLEAN, default `True`) — if true, this section's
+  tokens are registered as a Cutoff region with
+  `region_text == target_text == section text` (phrase-level
+  decontamination). If false, the section is still included in the
+  full prompt but not isolated.
+
+Outputs:
+- `conditioning` (CONDITIONING) — finalized through Cutoff; wire to a sampler.
+- `reference_full_prompt` (STRING) — the joined prompt text that CLIP
+  actually encoded; wire into ShowText to verify what you built.
+
+### Skipped sections
+
+Empty `section_N_text` (only whitespace, or blank) is skipped even within
+the active range — so you can leave some slots blank without contaminating
+the prompt.
+
+### Workflow shape
+
+```
+[Section 1: woman portrait]
+[Section 2: warm lighting]   --> Cutoff Sections Prompt --> KSampler positive
+[Section 3: city background]                              \
+                                                           +--> ShowText (reference_full_prompt)
+```
+
+All sections live on the same node face; increase / decrease
+`section_count` to expand or collapse.
 
 ---
 
