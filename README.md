@@ -20,7 +20,7 @@ This pack ships:
   metadata using the latent's actual W/H plus a zoom factor and offset.
   Recommended as the FINAL stop on both positive and negative
   conditioning before the sampler (see its section below).
-- **Conditioning Cutoff Sections Prompt** — single-node prompt builder
+- **CLIP Text Encode (Cutoff Region Separation)** — single-node prompt builder
   with a `section_count` you can expand/collapse manually. Each section
   has a text field and an `isolate` toggle that uses the Cutoff algorithm
   to confine that section's influence to its own tokens (prevents prompt
@@ -355,7 +355,7 @@ latent size on BOTH pos and neg in one node.
 
 ---
 
-## Conditioning Cutoff Sections Prompt
+## CLIP Text Encode (Cutoff Region Separation)
 
 A single-node prompt builder built on top of BlenderNeko's
 [ComfyUI_Cutoff](https://github.com/BlenderNeko/ComfyUI_Cutoff). The Cutoff
@@ -363,6 +363,17 @@ algorithm prevents prompt context bleeding by measuring each phrase's
 influence on the global CLIP embedding, then confining that influence back
 to the phrase's own tokens. Read the linked README for the underlying
 theory.
+
+This node also bundles:
+- **Per-section CLIP stream routing** (Pass L+G / Pass L / Pass G) — sections
+  are grouped by their stream choice, each group runs through Cutoff
+  independently, the resulting tensors are stream-masked (zero the L or G
+  half), and the per-group outputs are emitted as a multi-entry CONDITIONING
+  (combine-style — sampler treats each group as a parallel branch).
+- **SDXL size/crop metadata** — optional LATENT input determines target W/H
+  (defaults to 1024x1024 when LATENT is unconnected). `zoom` + `offset_x`
+  + `offset_y` widgets compute `width`/`height`/`crop_w`/`crop_h` per the
+  Conditioning-crop-zoom-SDXL math, applied to every output entry.
 
 **This node requires ComfyUI_Cutoff to be installed.** Without it, the node
 raises a clear runtime error pointing you to the install link.
@@ -402,6 +413,22 @@ raises a clear runtime error pointing you to the install link.
 
   Default `weight = 1.0` produces the same effect either way: bare text,
   no region weight, no attention wrap.
+
+- `section_N_clip` (dropdown: `Pass L+G` / `Pass L` / `Pass G`, default
+  `Pass L+G`) — which SDXL CLIP stream(s) this section's tokens contribute
+  to. Sections sharing a stream choice get grouped into one Cutoff pass.
+  Pass L = zero the G portion of the resulting tensor + zero pooled_output.
+  Pass G = zero the L portion. Non-SDXL conditioning (last dim != 2048)
+  passes through unchanged regardless of this setting.
+
+- `zoom` (FLOAT min 1.0, default 1.0) — SDXL "source frame larger than
+  rendered frame" zoom bias. Same semantics as the standalone
+  `Conditioning-crop-zoom-SDXL` node.
+- `offset_x` / `offset_y` (FLOAT -1..1, default 0) — position the
+  rendered frame inside the implied larger source. -1 = far left/top,
+  +1 = far right/bottom.
+- `latent` (LATENT, optional) — read for image-space W/H to use as the
+  SDXL target size. If unconnected, defaults to 1024×1024.
 
 Outputs:
 - `conditioning` (CONDITIONING) — finalized through Cutoff; wire to a sampler.

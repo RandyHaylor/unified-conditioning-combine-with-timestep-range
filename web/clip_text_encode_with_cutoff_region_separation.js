@@ -18,9 +18,9 @@
 
 import { app } from "../../scripts/app.js";
 
-const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "ConditioningCutoffSectionsPrompt";
+const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "CLIPTextEncodeWithCutoffRegionSeparation";
 
-const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight)$/;
+const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight|clip)$/;
 const SECTION_TEXT_WIDGET_NAME_REGEX = /^section_(\d+)_text$/;
 const SECTION_HEADER_WIDGET_NAME_PREFIX = "__section_header_for_index_";
 const SECTION_HEADER_WIDGET_NAME_REGEX = /^__section_header_for_index_(\d+)$/;
