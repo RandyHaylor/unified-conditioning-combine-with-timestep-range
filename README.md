@@ -457,15 +457,18 @@ not zero-masking).
 - `latent` (LATENT, optional) — read for image-space W/H to use as the
   SDXL target size for the primary `conditioning` output. If unconnected,
   defaults to 1024×1024.
-- `conditioning_upscale_by` (FLOAT, min 1.0, default 1.0) — multiplier
-  applied to the primary target W/H to derive the target W/H for the
+- `upscaled_conditioning_multiplier` (FLOAT, min 1.0, default 1.0,
+  displayed near the top of the node, NOT inside the zoom section since
+  it controls a different output entirely) — multiplier applied to the
+  primary target W/H to derive the target W/H for the
   `upscaled_conditioning` output. Computed in Python — does NOT take a
   downstream upscaled latent as input (ComfyUI validates the entire graph
   upfront, before any node runs, so a downstream latent doesn't exist at
   validation time). At `1.0` (default), `upscaled_conditioning` is
   identical to the primary `conditioning`. At e.g. `1.5`, upscaled
   metadata uses W*1.5 / H*1.5 — matching a typical hires-fix latent
-  upscale by 1.5x.
+  upscale by 1.5x. Zoom and offsets are also honored at the upscaled
+  resolution (framing intent stays consistent across resolutions).
 
 Outputs:
 - `conditioning` (CONDITIONING) — primary, sized to `latent`'s W/H.

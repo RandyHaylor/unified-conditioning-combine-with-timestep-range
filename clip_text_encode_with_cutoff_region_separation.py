@@ -66,8 +66,8 @@ OFFSET_MINIMUM_VALUE = -1.0
 OFFSET_MAXIMUM_VALUE = 1.0
 OFFSET_DEFAULT_VALUE = 0.0
 
-CONDITIONING_UPSCALE_BY_MINIMUM_VALUE = 1.0
-CONDITIONING_UPSCALE_BY_DEFAULT_VALUE = 1.0
+UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE = 1.0
+UPSCALED_CONDITIONING_MULTIPLIER_DEFAULT_VALUE = 1.0
 
 WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT = re.compile(r"\s+")
 
@@ -392,6 +392,11 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
     def INPUT_TYPES(cls):
         required_inputs_dict = {
             "clip": ("CLIP",),
+            "upscaled_conditioning_multiplier": ("FLOAT", {
+                "default": UPSCALED_CONDITIONING_MULTIPLIER_DEFAULT_VALUE,
+                "min": UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
+                "step": 0.01,
+            }),
             "section_count": ("INT", {
                 "default": DEFAULT_SECTION_COUNT_VALUE,
                 "min": 1,
@@ -418,11 +423,6 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                 "default": OFFSET_DEFAULT_VALUE,
                 "min": OFFSET_MINIMUM_VALUE,
                 "max": OFFSET_MAXIMUM_VALUE,
-                "step": 0.01,
-            }),
-            "conditioning_upscale_by": ("FLOAT", {
-                "default": CONDITIONING_UPSCALE_BY_DEFAULT_VALUE,
-                "min": CONDITIONING_UPSCALE_BY_MINIMUM_VALUE,
                 "step": 0.01,
             }),
         }
@@ -455,6 +455,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
     def encode_with_grouped_per_stream_cutoff_and_sdxl_zoom(
         self,
         clip,
+        upscaled_conditioning_multiplier,
         section_count,
         join_separator,
         mask_token,
@@ -463,7 +464,6 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         zoom,
         offset_x,
         offset_y,
-        conditioning_upscale_by,
         latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
@@ -480,7 +480,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         # ComfyUI validates the entire graph upfront, before any node has
         # run, so we can't read an upscaled-by-a-later-stage latent here.
         conditioning_upscale_factor_clamped = max(
-            CONDITIONING_UPSCALE_BY_MINIMUM_VALUE, float(conditioning_upscale_by)
+            UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE, float(upscaled_conditioning_multiplier)
         )
         upscaled_target_image_width = int(round(primary_target_image_width * conditioning_upscale_factor_clamped))
         upscaled_target_image_height = int(round(primary_target_image_height * conditioning_upscale_factor_clamped))
