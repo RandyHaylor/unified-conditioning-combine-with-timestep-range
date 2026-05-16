@@ -440,8 +440,13 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
-    RETURN_NAMES = ("conditioning", "upscaled_conditioning", "reference_full_prompt")
+    # NOTE on output ordering: `reference_full_prompt` stays at index 1 to
+    # preserve backward compat with workflows saved before the upscaled
+    # output existed (they had ShowText / SaveText wired to index-1 STRING).
+    # `upscaled_conditioning` is added at the END (index 2) so existing
+    # wires keep matching types.
+    RETURN_TYPES = ("CONDITIONING", "STRING", "CONDITIONING")
+    RETURN_NAMES = ("conditioning", "reference_full_prompt", "upscaled_conditioning")
     FUNCTION = "encode_with_grouped_per_stream_cutoff_and_sdxl_zoom"
     CATEGORY = "unified-conditioning-merge"
 
@@ -514,7 +519,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                     f"CLIPTextEncodeWithCutoffRegionSeparation: empty-prompt encode failed: "
                     f"{encoding_failure_for_empty_prompt}"
                 )
-                return ([], [], "")
+                return ([], "", [])
         else:
             grouped_sections_by_clip_pass_choice = _group_active_sections_by_their_clip_pass_choice(
                 active_section_descriptors_list
@@ -580,6 +585,6 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         reference_full_prompt_text_for_output = "\n".join(per_group_full_prompt_text_for_reference_display)
         return (
             primary_output_conditioning_entries,
-            upscaled_output_conditioning_entries,
             reference_full_prompt_text_for_output,
+            upscaled_output_conditioning_entries,
         )
