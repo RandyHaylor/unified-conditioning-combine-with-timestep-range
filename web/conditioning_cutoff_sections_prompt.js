@@ -21,6 +21,12 @@ const HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT = -4;
 
 function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
   if (!widget_to_show_or_hide) return;
+  // Two things to hide / show:
+  //   (a) the canvas-drawn widget (controlled via computeSize + type)
+  //   (b) the DOM element ComfyUI may have inserted for STRING multiline /
+  //       FLOAT / etc. widgets — these are positioned outside the canvas
+  //       and ignore the computeSize trick, so they'd "hang off" the node
+  //       bottom when hidden.
   if (should_be_hidden) {
     if (widget_to_show_or_hide.__cutoff_original_compute_size === undefined) {
       widget_to_show_or_hide.__cutoff_original_compute_size = widget_to_show_or_hide.computeSize;
@@ -30,6 +36,20 @@ function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
       return [0, HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT];
     };
     widget_to_show_or_hide.type = "hidden";
+    // DOM-rendered companions:
+    const dom_element_candidates_to_hide = [
+      widget_to_show_or_hide.element,
+      widget_to_show_or_hide.inputEl,
+      widget_to_show_or_hide.input,
+    ];
+    for (const dom_element of dom_element_candidates_to_hide) {
+      if (dom_element && dom_element.style !== undefined) {
+        if (widget_to_show_or_hide.__cutoff_original_dom_display === undefined) {
+          widget_to_show_or_hide.__cutoff_original_dom_display = dom_element.style.display || "";
+        }
+        dom_element.style.display = "none";
+      }
+    }
   } else {
     if (widget_to_show_or_hide.__cutoff_original_compute_size !== undefined) {
       widget_to_show_or_hide.computeSize = widget_to_show_or_hide.__cutoff_original_compute_size;
@@ -37,6 +57,17 @@ function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
       widget_to_show_or_hide.__cutoff_original_compute_size = undefined;
       widget_to_show_or_hide.__cutoff_original_type = undefined;
     }
+    const dom_element_candidates_to_show = [
+      widget_to_show_or_hide.element,
+      widget_to_show_or_hide.inputEl,
+      widget_to_show_or_hide.input,
+    ];
+    for (const dom_element of dom_element_candidates_to_show) {
+      if (dom_element && dom_element.style !== undefined) {
+        dom_element.style.display = widget_to_show_or_hide.__cutoff_original_dom_display || "";
+      }
+    }
+    widget_to_show_or_hide.__cutoff_original_dom_display = undefined;
   }
 }
 
@@ -100,6 +131,13 @@ app.registerExtension({
       }
 
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
+      // DOM elements for multiline STRING / FLOAT widgets are sometimes
+      // inserted asynchronously after onNodeCreated returns. Run a second
+      // pass next tick so the DOM hide also gets applied.
+      const node_reference_for_deferred_update = this;
+      setTimeout(function () {
+        updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node_reference_for_deferred_update);
+      }, 0);
       return original_on_node_created_return_value;
     };
 
@@ -112,6 +150,21 @@ app.registerExtension({
       // section_count widget value.
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       return original_on_configure_return_value;
+    };
+
+    // ComfyUI fires node.onWidgetChanged when any widget's value changes.
+    // Hooking it as a second path (in addition to wrapping section_count's
+    // callback) makes the update fire reliably even if the callback wrap
+    // is bypassed by some widget implementations.
+    const original_on_widget_changed_function = nodeType.prototype.onWidgetChanged;
+    nodeType.prototype.onWidgetChanged = function (changed_widget_name, _new_widget_value, _old_widget_value, _changed_widget) {
+      const original_on_widget_changed_return_value = original_on_widget_changed_function
+        ? original_on_widget_changed_function.apply(this, arguments)
+        : undefined;
+      if (changed_widget_name === "section_count") {
+        updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
+      }
+      return original_on_widget_changed_return_value;
     };
   },
 });
