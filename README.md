@@ -375,8 +375,14 @@ This node also bundles:
   + `offset_y` widgets compute `width`/`height`/`crop_w`/`crop_h` per the
   Conditioning-crop-zoom-SDXL math, applied to every output entry.
 
-**This node requires ComfyUI_Cutoff to be installed.** Without it, the node
-raises a clear runtime error pointing you to the install link.
+**Self-contained — no external plugin dependency.** The Cutoff algorithm
+itself (mask targets, encode masked variant, blend per-token by region) is
+re-implemented from scratch in `cutoff_per_stream_isolation.py` under MIT
+license. This means we can run the algorithm **independently per CLIP
+stream** (L and G), which lets per-section CLIP routing actually work —
+when a section is "L only", the L stream encodes that section's text and
+the G stream encodes the empty prompt (natural CLIP-G empty embedding,
+not zero-masking).
 
 ### UI
 

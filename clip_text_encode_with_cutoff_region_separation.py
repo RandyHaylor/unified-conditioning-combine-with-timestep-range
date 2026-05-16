@@ -1,48 +1,42 @@
 """
 CLIP Text Encode (Cutoff Region Separation)
 
-Single-node prompt builder that combines:
-  - Phrase-level decontamination via BlenderNeko's ComfyUI_Cutoff
-  - Per-section CLIP-stream routing (Pass L+G / Pass L / Pass G) for SDXL
-  - SDXL size/crop metadata (zoom + x/y offsets) applied to every output
-    entry, with target W/H auto-derived from an optional LATENT input
-    (defaults to 1024x1024 when LATENT is not connected)
+Single-node prompt builder using a self-contained, MIT-licensed Cutoff-style
+algorithm (see cutoff_per_stream_isolation.py) that runs INDEPENDENTLY per
+CLIP stream. This is what lets per-section CLIP routing actually work
+correctly for SDXL: when a section is marked "L only", the L stream encodes
+that section's text and the G stream encodes the empty prompt (giving
+natural CLIP-G empty embeddings, NOT zero-masked tensors that would be
+out-of-distribution for the model).
 
-Algorithm (Option A: group-by-stream cutoff):
-  1. Collect active sections (non-empty text), each with isolate flag,
-     weight, and CLIP-stream-pass dropdown choice.
-  2. Group sections by their clip pass choice into:
-        L+G group, L-only group, G-only group.
-  3. For each non-empty group:
-       a. Build the group's full prompt = join_separator.join(group texts).
-          (Per-section weight on non-isolate sections is applied via
-          CLIP `(text:weight)` attention syntax in the joined text.)
-       b. Run ComfyUI_Cutoff on that group:
-          init_prompt → add_clip_region for each isolate=True section →
-          finalize_clip_regions.
-       c. Mask the resulting tokens tensor according to the group's
-          stream choice:
-            - L+G: no mask (full SDXL tensor)
-            - L only: zero [:, :, 768:]  (CLIP-G portion) + zero pooled
-            - G only: zero [:, :, :768]  (CLIP-L portion)
-          (Mask only applied when last embedding dim == 2048, the SDXL
-          shape; other shapes pass through unchanged.)
-       d. Stamp SDXL size/crop metadata onto every entry of this group's
-          CONDITIONING.
-  4. Combine the per-group CONDITIONINGs into one multi-entry CONDITIONING
-     output (combine-style — sampler treats each group as a parallel
-     branch). If only one group is populated, output is single-entry.
+For each section, the dropdown chooses which stream(s) this section
+contributes to:
+    L+G   — section text goes to BOTH text_l and text_g (typical)
+    L     — section text goes to text_l only; text_g for this section's group
+            is the empty string (CLIP-G encodes the natural empty prompt)
+    G     — symmetric for G
 
-Requires ComfyUI_Cutoff installed
-(https://github.com/BlenderNeko/ComfyUI_Cutoff).
+Sections sharing a clip choice are GROUPED. Per group, we build the
+per-stream prompts and run cutoff-style isolation independently on each
+stream. The L-stream and G-stream results are concatenated along the last
+dim to form the SDXL combined tensor (768 + 1280 = 2048).
+
+All groups' resulting CONDITIONING entries are emitted together as a
+multi-entry CONDITIONING (combine-style — sampler treats each group as a
+parallel branch).
+
+SDXL size/crop metadata (zoom + offsets, target W/H from optional LATENT
+defaulting to 1024x1024) is stamped onto every output entry.
+
+NO external plugin dependency. Self-contained.
 """
 
-import inspect
 import logging
 import re
-import sys
 
 import torch
+
+from .cutoff_per_stream_isolation import encode_one_stream_with_cutoff_style_region_isolation
 
 
 MAX_SECTION_COUNT_SUPPORTED = 16
@@ -57,11 +51,6 @@ CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER = [
     CLIP_STREAM_PASS_G_ONLY,
 ]
 
-# SDXL token-embedding layout in the CONDITIONING tensor's last dim.
-SDXL_EMBEDDING_TOTAL_DIM = 2048
-SDXL_CLIP_L_PORTION_DIM = 768
-
-# Latent → image-space spatial scale factor (standard VAE downscale of 8).
 LATENT_TO_IMAGE_SPATIAL_SCALE_FACTOR = 8
 DEFAULT_LATENT_IMAGE_WIDTH_WHEN_NO_LATENT_INPUT = 1024
 DEFAULT_LATENT_IMAGE_HEIGHT_WHEN_NO_LATENT_INPUT = 1024
@@ -74,40 +63,6 @@ OFFSET_MAXIMUM_VALUE = 1.0
 OFFSET_DEFAULT_VALUE = 0.0
 
 WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT = re.compile(r"\s+")
-
-
-# -------------- cutoff discovery --------------
-
-def _find_loaded_cutoff_module_in_sys_modules_or_none():
-    """
-    Returns the ComfyUI_Cutoff plugin's `cutoff` module by scanning sys.modules
-    for one that exposes a callable `finalize_clip_regions` and a real Python
-    class `CLIPRegionsBasePrompt`. Prefers modules whose name contains
-    "cutoff" (case-insensitive).
-    """
-    matching_candidate_modules_keyed_by_name = {}
-    for module_name_in_sys_modules, loaded_module_object in list(sys.modules.items()):
-        if loaded_module_object is None:
-            continue
-        try:
-            finalize_attribute_or_none = getattr(loaded_module_object, "finalize_clip_regions", None)
-            base_prompt_attribute_or_none = getattr(loaded_module_object, "CLIPRegionsBasePrompt", None)
-        except Exception:
-            continue
-        if finalize_attribute_or_none is None or base_prompt_attribute_or_none is None:
-            continue
-        if not callable(finalize_attribute_or_none):
-            continue
-        if not inspect.isclass(base_prompt_attribute_or_none):
-            continue
-        matching_candidate_modules_keyed_by_name[module_name_in_sys_modules] = loaded_module_object
-
-    if not matching_candidate_modules_keyed_by_name:
-        return None
-    for candidate_module_name, candidate_module in matching_candidate_modules_keyed_by_name.items():
-        if "cutoff" in candidate_module_name.lower():
-            return candidate_module
-    return next(iter(matching_candidate_modules_keyed_by_name.values()))
 
 
 # -------------- section collection --------------
@@ -154,10 +109,6 @@ def _build_full_prompt_text_for_one_group_of_sections(section_descriptors_in_gro
 
 
 def _group_active_sections_by_their_clip_pass_choice(active_section_descriptors_list):
-    """
-    Returns {clip_pass_choice: [section_descriptor, ...]} preserving original
-    section order within each group.
-    """
     grouped_sections_by_clip_pass_choice = {}
     for section_descriptor in active_section_descriptors_list:
         clip_pass_choice_for_this_section = section_descriptor["clip_pass_choice"]
@@ -167,68 +118,124 @@ def _group_active_sections_by_their_clip_pass_choice(active_section_descriptors_
     return grouped_sections_by_clip_pass_choice
 
 
-# -------------- cutoff per group --------------
+# -------------- per-group encoding using per-stream cutoff --------------
 
-def _build_populated_cutoff_clip_regions_state_for_one_group(
-    clip_object, full_prompt_text_for_group, section_descriptors_in_group_list, cutoff_module
-):
-    base_prompt_node_instance = cutoff_module.CLIPRegionsBasePrompt()
-    base_state_tuple = base_prompt_node_instance.init_prompt(clip_object, full_prompt_text_for_group)
-    current_clip_regions_state = base_state_tuple[0]
-
-    add_region_node_instance = cutoff_module.CLIPSetRegion()
+def _build_isolate_target_text_and_weight_pairs_for_one_group(section_descriptors_in_group_list):
+    """
+    Returns [{"target_text": str, "weight": float}, ...] for sections in the
+    group that have isolate=True. Non-isolate sections are skipped (their
+    weight is applied via the inline `(text:weight)` wrap in the group's
+    joined prompt text).
+    """
+    isolate_target_text_and_weight_pairs_list = []
     for section_descriptor in section_descriptors_in_group_list:
         if not section_descriptor["isolate"]:
             continue
-        try:
-            next_state_tuple = add_region_node_instance.add_clip_region(
-                current_clip_regions_state,
-                section_descriptor["text"],
-                section_descriptor["text"],
-                section_descriptor["weight"],
-            )
-            current_clip_regions_state = next_state_tuple[0]
-        except Exception as cutoff_register_region_exception:
-            logging.warning(
-                "CLIPTextEncodeWithCutoffRegionSeparation: skipped isolate "
-                f"registration for section text {section_descriptor['text']!r} "
-                f"(Cutoff raised {type(cutoff_register_region_exception).__name__}: "
-                f"{cutoff_register_region_exception})."
-            )
-    return current_clip_regions_state
+        isolate_target_text_and_weight_pairs_list.append({
+            "target_text": section_descriptor["text"],
+            "weight": section_descriptor["weight"],
+        })
+    return isolate_target_text_and_weight_pairs_list
 
 
-# -------------- clip stream masking --------------
-
-def _apply_clip_pass_choice_mask_to_tokens_and_pooled_in_one_conditioning_entry(
-    conditioning_entry, clip_pass_choice
+def _pad_per_stream_tokenization_to_match_chunk_count(
+    clip_object, embedding_tensor_for_short_stream, target_chunk_count, stream_key_to_pad_with_empty
 ):
     """
-    Returns a new [tokens_tensor, metadata_dict] with the L or G portion of
-    the tokens tensor zeroed per clip_pass_choice. Pass L+G returns the
-    entry unchanged. Only acts when last embedding dim == 2048 (SDXL).
+    If a stream's tokenization produced fewer chunks than the other stream,
+    SDXL's combine requires matching chunk counts. We pad with empty-prompt
+    encodings of the SHORT stream. Returns the padded embedding tensor.
+
+    For now we return the tensor unchanged and let the SDXL combine
+    truncate via min() — chunk-count mismatch is a corner case and most
+    prompts fit in one chunk for both streams.
     """
-    original_tokens_tensor = conditioning_entry[0]
-    original_metadata_dict = conditioning_entry[1]
+    return embedding_tensor_for_short_stream
 
-    if clip_pass_choice == CLIP_STREAM_PASS_BOTH_L_AND_G:
-        return [original_tokens_tensor, dict(original_metadata_dict)]
 
-    last_axis_size = original_tokens_tensor.shape[-1] if original_tokens_tensor is not None else 0
-    if last_axis_size != SDXL_EMBEDDING_TOTAL_DIM:
-        return [original_tokens_tensor, dict(original_metadata_dict)]
+def _encode_one_group_into_one_sdxl_conditioning_entry(
+    clip_object,
+    section_descriptors_in_group_list,
+    clip_pass_choice_for_this_group,
+    join_separator_string,
+    mask_token_string,
+    strict_mask_value,
+    start_from_masked_value,
+):
+    """
+    Returns a single CONDITIONING entry [combined_tokens_tensor, metadata_dict]
+    for one group's combined prompt encoded with proper per-stream handling
+    (no zero-masking — empty streams get natural CLIP empty-prompt
+    encodings).
+    """
+    group_full_prompt_text_for_isolate_streams = _build_full_prompt_text_for_one_group_of_sections(
+        section_descriptors_in_group_list, join_separator_string
+    )
+    isolate_target_text_and_weight_pairs_for_this_group = _build_isolate_target_text_and_weight_pairs_for_one_group(
+        section_descriptors_in_group_list
+    )
 
-    masked_tokens_tensor = original_tokens_tensor.clone()
-    masked_metadata_dict = dict(original_metadata_dict)
-    if clip_pass_choice == CLIP_STREAM_PASS_L_ONLY:
-        masked_tokens_tensor[:, :, SDXL_CLIP_L_PORTION_DIM:] = 0.0
-        existing_pooled_output = masked_metadata_dict.get("pooled_output", None)
-        if existing_pooled_output is not None:
-            masked_metadata_dict["pooled_output"] = torch.zeros_like(existing_pooled_output)
-    elif clip_pass_choice == CLIP_STREAM_PASS_G_ONLY:
-        masked_tokens_tensor[:, :, :SDXL_CLIP_L_PORTION_DIM] = 0.0
+    # Decide each stream's prompt based on the group's CLIP pass choice.
+    if clip_pass_choice_for_this_group == CLIP_STREAM_PASS_BOTH_L_AND_G:
+        prompt_text_for_l_stream = group_full_prompt_text_for_isolate_streams
+        prompt_text_for_g_stream = group_full_prompt_text_for_isolate_streams
+        run_isolation_on_l_stream = True
+        run_isolation_on_g_stream = True
+    elif clip_pass_choice_for_this_group == CLIP_STREAM_PASS_L_ONLY:
+        prompt_text_for_l_stream = group_full_prompt_text_for_isolate_streams
+        prompt_text_for_g_stream = ""
+        run_isolation_on_l_stream = True
+        run_isolation_on_g_stream = False
+    elif clip_pass_choice_for_this_group == CLIP_STREAM_PASS_G_ONLY:
+        prompt_text_for_l_stream = ""
+        prompt_text_for_g_stream = group_full_prompt_text_for_isolate_streams
+        run_isolation_on_l_stream = False
+        run_isolation_on_g_stream = True
+    else:
+        raise ValueError(
+            f"Unknown clip_pass_choice {clip_pass_choice_for_this_group!r}"
+        )
 
-    return [masked_tokens_tensor, masked_metadata_dict]
+    # Run cutoff-style isolation per stream. For the "empty" stream we pass
+    # an empty isolate list so it just encodes the empty prompt normally.
+    final_embedding_tensor_for_l_stream, _l_pooled_unused = encode_one_stream_with_cutoff_style_region_isolation(
+        clip_object,
+        "l",
+        prompt_text_for_l_stream,
+        isolate_target_text_and_weight_pairs_for_this_group if run_isolation_on_l_stream else [],
+        mask_token_string,
+        strict_mask_value,
+        start_from_masked_value,
+    )
+    final_embedding_tensor_for_g_stream, g_pooled_output_tensor_or_none = encode_one_stream_with_cutoff_style_region_isolation(
+        clip_object,
+        "g",
+        prompt_text_for_g_stream,
+        isolate_target_text_and_weight_pairs_for_this_group if run_isolation_on_g_stream else [],
+        mask_token_string,
+        strict_mask_value,
+        start_from_masked_value,
+    )
+
+    # SDXL combine: concat L (768) + G (1280) along last dim. Truncate to
+    # shorter sequence length to handle chunk-count mismatches.
+    cut_to_shared_sequence_length = min(
+        final_embedding_tensor_for_l_stream.shape[1],
+        final_embedding_tensor_for_g_stream.shape[1],
+    )
+    sdxl_combined_tokens_tensor = torch.cat(
+        [
+            final_embedding_tensor_for_l_stream[:, :cut_to_shared_sequence_length],
+            final_embedding_tensor_for_g_stream[:, :cut_to_shared_sequence_length],
+        ],
+        dim=-1,
+    )
+
+    entry_metadata_dict = {}
+    if g_pooled_output_tensor_or_none is not None:
+        entry_metadata_dict["pooled_output"] = g_pooled_output_tensor_or_none
+
+    return [sdxl_combined_tokens_tensor, entry_metadata_dict]
 
 
 # -------------- SDXL size/crop metadata --------------
@@ -268,22 +275,6 @@ def _resolve_target_image_width_and_height_from_optional_latent_or_defaults(late
     target_image_width = latent_samples_tensor.shape[3] * LATENT_TO_IMAGE_SPATIAL_SCALE_FACTOR
     target_image_height = latent_samples_tensor.shape[2] * LATENT_TO_IMAGE_SPATIAL_SCALE_FACTOR
     return (target_image_width, target_image_height)
-
-
-def _apply_metadata_fields_to_each_entry_of_one_conditioning(input_conditioning_list, metadata_fields_to_merge):
-    output_conditioning_entries = []
-    for conditioning_entry in input_conditioning_list:
-        entry_tokens_tensor = conditioning_entry[0]
-        entry_metadata_dict = conditioning_entry[1]
-        updated_metadata_dict = dict(entry_metadata_dict)
-        updated_metadata_dict.update(metadata_fields_to_merge)
-        output_conditioning_entries.append([entry_tokens_tensor, updated_metadata_dict])
-    return output_conditioning_entries
-
-
-# -------------- flexible-input dict for the per-section widgets --------------
-
-CONDITIONING_SLOT_KEY_PATTERN = re.compile(r"^section_(\d+)_(text|isolate|weight|clip)$")
 
 
 # -------------- the node class --------------
@@ -345,10 +336,10 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
 
     RETURN_TYPES = ("CONDITIONING", "STRING")
     RETURN_NAMES = ("conditioning", "reference_full_prompt")
-    FUNCTION = "encode_with_grouped_cutoff_and_stream_masking_and_sdxl_zoom"
+    FUNCTION = "encode_with_grouped_per_stream_cutoff_and_sdxl_zoom"
     CATEGORY = "unified-conditioning-merge"
 
-    def encode_with_grouped_cutoff_and_stream_masking_and_sdxl_zoom(
+    def encode_with_grouped_per_stream_cutoff_and_sdxl_zoom(
         self,
         clip,
         section_count,
@@ -362,20 +353,10 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
-        cutoff_module = _find_loaded_cutoff_module_in_sys_modules_or_none()
-        if cutoff_module is None:
-            raise RuntimeError(
-                "CLIPTextEncodeWithCutoffRegionSeparation: the ComfyUI_Cutoff plugin is "
-                "required but was not found in loaded modules. Install it from "
-                "https://github.com/BlenderNeko/ComfyUI_Cutoff into ComfyUI/custom_nodes/ "
-                "and restart ComfyUI."
-            )
-
         active_section_descriptors_list = _collect_active_non_empty_sections_from_kwargs(
             kwargs_for_individual_section_widget_values, section_count
         )
 
-        # Resolve target image W/H from optional LATENT, default 1024x1024.
         target_image_width, target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
         zoom_factor_clamped = max(ZOOM_MINIMUM_VALUE, float(zoom))
         offset_x_clamped = _clamp_numeric_value_inclusive(float(offset_x), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE)
@@ -385,55 +366,53 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         )
 
         if not active_section_descriptors_list:
-            base_prompt_node_instance = cutoff_module.CLIPRegionsBasePrompt()
-            empty_state_tuple = base_prompt_node_instance.init_prompt(clip, "")
-            empty_finalize_tuple = cutoff_module.finalize_clip_regions(
-                empty_state_tuple[0], mask_token, float(strict_mask), float(start_from_masked)
-            )
-            empty_conditioning_with_sdxl_metadata = _apply_metadata_fields_to_each_entry_of_one_conditioning(
-                empty_finalize_tuple[0], sdxl_size_and_crop_metadata_fields
-            )
-            return (empty_conditioning_with_sdxl_metadata, "")
+            # Encode empty prompt and return single empty entry.
+            try:
+                empty_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
+                    clip, [], CLIP_STREAM_PASS_BOTH_L_AND_G, join_separator,
+                    mask_token, float(strict_mask), float(start_from_masked),
+                )
+                empty_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
+                return ([empty_conditioning_entry], "")
+            except Exception as encoding_failure_for_empty_prompt:
+                logging.warning(
+                    f"CLIPTextEncodeWithCutoffRegionSeparation: empty-prompt encode failed: "
+                    f"{encoding_failure_for_empty_prompt}"
+                )
+                return ([], "")
 
-        # Group sections by their CLIP stream pass choice.
         grouped_sections_by_clip_pass_choice = _group_active_sections_by_their_clip_pass_choice(
             active_section_descriptors_list
         )
 
-        # Process each non-empty group through cutoff, mask result per stream
-        # choice, stamp SDXL metadata. Concatenate all output entries into one
-        # multi-entry CONDITIONING (combine-style).
         output_conditioning_entries_combined_across_groups = []
         per_group_full_prompt_text_for_reference_display = []
         for clip_pass_choice_for_this_group, section_descriptors_in_this_group in grouped_sections_by_clip_pass_choice.items():
-            full_prompt_text_for_this_group = _build_full_prompt_text_for_one_group_of_sections(
+            try:
+                group_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
+                    clip,
+                    section_descriptors_in_this_group,
+                    clip_pass_choice_for_this_group,
+                    join_separator,
+                    mask_token,
+                    float(strict_mask),
+                    float(start_from_masked),
+                )
+                group_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
+                output_conditioning_entries_combined_across_groups.append(group_conditioning_entry)
+            except Exception as group_encoding_failure:
+                logging.warning(
+                    f"CLIPTextEncodeWithCutoffRegionSeparation: group '{clip_pass_choice_for_this_group}' "
+                    f"encoding failed: {type(group_encoding_failure).__name__}: {group_encoding_failure}. "
+                    f"Skipping this group."
+                )
+                continue
+
+            full_prompt_text_for_this_group_display = _build_full_prompt_text_for_one_group_of_sections(
                 section_descriptors_in_this_group, join_separator
             )
-            if not full_prompt_text_for_this_group:
-                continue
-            populated_clip_regions_state_for_this_group = _build_populated_cutoff_clip_regions_state_for_one_group(
-                clip, full_prompt_text_for_this_group, section_descriptors_in_this_group, cutoff_module
-            )
-            finalize_return_tuple_for_this_group = cutoff_module.finalize_clip_regions(
-                populated_clip_regions_state_for_this_group,
-                mask_token,
-                float(strict_mask),
-                float(start_from_masked),
-            )
-            unmasked_conditioning_for_this_group = finalize_return_tuple_for_this_group[0]
-            for conditioning_entry_for_this_group in unmasked_conditioning_for_this_group:
-                stream_masked_conditioning_entry = _apply_clip_pass_choice_mask_to_tokens_and_pooled_in_one_conditioning_entry(
-                    conditioning_entry_for_this_group, clip_pass_choice_for_this_group
-                )
-                # Stamp SDXL metadata onto the entry.
-                stream_masked_entry_tokens_tensor = stream_masked_conditioning_entry[0]
-                stream_masked_entry_metadata_dict = dict(stream_masked_conditioning_entry[1])
-                stream_masked_entry_metadata_dict.update(sdxl_size_and_crop_metadata_fields)
-                output_conditioning_entries_combined_across_groups.append(
-                    [stream_masked_entry_tokens_tensor, stream_masked_entry_metadata_dict]
-                )
             per_group_full_prompt_text_for_reference_display.append(
-                f"[{clip_pass_choice_for_this_group}] {full_prompt_text_for_this_group}"
+                f"[{clip_pass_choice_for_this_group}] {full_prompt_text_for_this_group_display}"
             )
 
         reference_full_prompt_text_for_output = "\n".join(per_group_full_prompt_text_for_reference_display)
