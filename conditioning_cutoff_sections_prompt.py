@@ -25,6 +25,7 @@ Requires ComfyUI_Cutoff installed
 clear runtime error pointing at the install URL.
 """
 
+import inspect
 import sys
 
 
@@ -35,15 +36,45 @@ DEFAULT_SECTION_COUNT_VALUE = 3
 def _find_loaded_cutoff_module_in_sys_modules_or_none():
     """
     Returns the ComfyUI_Cutoff plugin's `cutoff` module by scanning sys.modules
-    for one that exposes both `finalize_clip_regions` and `CLIPRegionsBasePrompt`.
-    Returns None if the plugin isn't installed/loaded.
+    for one that exposes BOTH:
+      - a callable `finalize_clip_regions`
+      - a real Python class `CLIPRegionsBasePrompt` (verified via inspect.isclass)
+
+    The class check is critical — without it, modules like `torch._OpNamespace`
+    whose `__getattr__` returns op handles for any requested attribute name
+    will pass a naive hasattr check, leading to TypeErrors when we try to
+    instantiate the returned non-class.
+
+    Prefers modules whose name contains "cutoff" (case-insensitive) when
+    multiple candidates match.
     """
-    for _module_name, loaded_module in list(sys.modules.items()):
-        if loaded_module is None:
+    matching_candidate_modules_keyed_by_name = {}
+    for module_name_in_sys_modules, loaded_module_object in list(sys.modules.items()):
+        if loaded_module_object is None:
             continue
-        if hasattr(loaded_module, "finalize_clip_regions") and hasattr(loaded_module, "CLIPRegionsBasePrompt"):
-            return loaded_module
-    return None
+        try:
+            finalize_attribute_or_none = getattr(loaded_module_object, "finalize_clip_regions", None)
+            base_prompt_attribute_or_none = getattr(loaded_module_object, "CLIPRegionsBasePrompt", None)
+        except Exception:
+            continue
+        if finalize_attribute_or_none is None or base_prompt_attribute_or_none is None:
+            continue
+        if not callable(finalize_attribute_or_none):
+            continue
+        if not inspect.isclass(base_prompt_attribute_or_none):
+            continue
+        matching_candidate_modules_keyed_by_name[module_name_in_sys_modules] = loaded_module_object
+
+    if not matching_candidate_modules_keyed_by_name:
+        return None
+
+    # Prefer modules whose name contains "cutoff" (case-insensitive).
+    for candidate_module_name, candidate_module in matching_candidate_modules_keyed_by_name.items():
+        if "cutoff" in candidate_module_name.lower():
+            return candidate_module
+
+    # Fallback: first match in iteration order.
+    return next(iter(matching_candidate_modules_keyed_by_name.values()))
 
 
 def _collect_active_non_empty_sections_from_kwargs(kwargs_dict, active_section_count):
