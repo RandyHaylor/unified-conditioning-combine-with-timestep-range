@@ -66,6 +66,9 @@ OFFSET_MINIMUM_VALUE = -1.0
 OFFSET_MAXIMUM_VALUE = 1.0
 OFFSET_DEFAULT_VALUE = 0.0
 
+CONDITIONING_UPSCALE_BY_MINIMUM_VALUE = 1.0
+CONDITIONING_UPSCALE_BY_DEFAULT_VALUE = 1.0
+
 WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT = re.compile(r"\s+")
 
 
@@ -417,6 +420,11 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                 "max": OFFSET_MAXIMUM_VALUE,
                 "step": 0.01,
             }),
+            "conditioning_upscale_by": ("FLOAT", {
+                "default": CONDITIONING_UPSCALE_BY_DEFAULT_VALUE,
+                "min": CONDITIONING_UPSCALE_BY_MINIMUM_VALUE,
+                "step": 0.01,
+            }),
         }
         for section_index_for_declaration in range(1, MAX_SECTION_COUNT_SUPPORTED + 1):
             required_inputs_dict[f"section_{section_index_for_declaration}_text"] = (
@@ -436,7 +444,6 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
             "required": required_inputs_dict,
             "optional": {
                 "latent": ("LATENT",),
-                "upscaled_latent": ("LATENT",),
             },
         }
 
@@ -456,8 +463,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         zoom,
         offset_x,
         offset_y,
+        conditioning_upscale_by,
         latent=None,
-        upscaled_latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
         active_section_descriptors_list = _collect_active_non_empty_sections_from_kwargs(
@@ -466,15 +473,17 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
 
         # Resolve target W/H for the PRIMARY conditioning's SDXL metadata.
         primary_target_image_width, primary_target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
-        # Resolve target W/H for the UPSCALED conditioning's SDXL metadata.
-        # If upscaled_latent is not connected, fall back to the primary
-        # target W/H so the upscaled output is identical to the primary
-        # (the user can still wire it through a second sampler that
-        # produces the same image as the first — harmless).
-        upscaled_target_image_width, upscaled_target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(upscaled_latent)
-        if upscaled_latent is None:
-            upscaled_target_image_width = primary_target_image_width
-            upscaled_target_image_height = primary_target_image_height
+        # The UPSCALED conditioning's target W/H is the primary target W/H
+        # multiplied by the conditioning_upscale_by widget value. Computed
+        # in Python (not from a downstream latent input) because the
+        # downstream latent doesn't exist at prompt-validation time —
+        # ComfyUI validates the entire graph upfront, before any node has
+        # run, so we can't read an upscaled-by-a-later-stage latent here.
+        conditioning_upscale_factor_clamped = max(
+            CONDITIONING_UPSCALE_BY_MINIMUM_VALUE, float(conditioning_upscale_by)
+        )
+        upscaled_target_image_width = int(round(primary_target_image_width * conditioning_upscale_factor_clamped))
+        upscaled_target_image_height = int(round(primary_target_image_height * conditioning_upscale_factor_clamped))
 
         zoom_factor_clamped = max(ZOOM_MINIMUM_VALUE, float(zoom))
         offset_x_clamped = _clamp_numeric_value_inclusive(float(offset_x), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE)
