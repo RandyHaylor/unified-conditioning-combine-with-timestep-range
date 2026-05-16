@@ -470,6 +470,18 @@ not zero-masking).
   upscale by 1.5x. Zoom and offsets are also honored at the upscaled
   resolution (framing intent stays consistent across resolutions).
 
+  Empirically verified: feeding a multiplier that matches the second-stage
+  latent upscale (so the upscaled-stage sampler sees SDXL target W/H that
+  reflect the larger working resolution) **does help fine detail and final
+  sharpness** on the upscaling step. The effect is subtle but real, and
+  becomes more noticeable with:
+  - photoreal models (where micro-detail like skin pores, fabric weave,
+    and hair strands is what the eye reads as "sharp"), and
+  - higher second-stage step counts (more denoise iterations have more
+    opportunity to act on the target-size cue).
+  At `1.0` the upscale-stage conditioning still claims base-resolution
+  W/H, which is the main thing this multiplier is fixing.
+
 Outputs:
 - `conditioning` (CONDITIONING) — primary, sized to `latent`'s W/H.
 - `upscaled_conditioning` (CONDITIONING) — same prompt encoding, sized to
