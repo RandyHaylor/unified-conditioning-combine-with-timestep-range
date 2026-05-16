@@ -55,7 +55,14 @@ function toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(node, wi
 
   if (should_be_visible) {
     widget_to_toggle.type = cached_original_props_for_this_widget.original_type;
-    widget_to_toggle.computeSize = cached_original_props_for_this_widget.original_compute_size_function;
+    // CRITICAL: do NOT restore widget.computeSize from cache. ComfyUI
+    // computes widget sizes lazily based on widget.type via class-level
+    // defaults; the cached value at first-hide may have been undefined
+    // (verified empirically — after restore, widget.computeSize was
+    // undefined, which made the widget render at sliver height).
+    // `delete` the instance-level override so LiteGraph's default
+    // computeSize for the restored type takes effect again.
+    delete widget_to_toggle.computeSize;
     widget_to_toggle.hidden = false;
     // Also unhide any DOM companion (textarea for STRING multiline, etc.)
     if (widget_to_toggle.element && widget_to_toggle.element.style) {
