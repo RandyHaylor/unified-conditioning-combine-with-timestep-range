@@ -175,6 +175,74 @@ def _encode_one_group_via_classic_upstream_cutoff_plugin(
 
 # -------------- section collection --------------
 
+def _emit_stock_style_shape_mismatch_warning_for_each_embedding_in_text_that_will_not_match_its_clip_stream_dim(
+    clip_object_to_inspect, prompt_text_to_scan_for_embedding_references
+):
+    """
+    Mirror the WARNING emitted by ComfyUI's stock CLIPTextEncode when a
+    textual-inversion embedding's saved hidden-dim does not match a CLIP
+    stream's expected hidden-dim (e.g. an SD1.5 768-dim embedding referenced
+    in an SDXL prompt where CLIP-G expects 1280).
+
+    Stock's warning comes from `SDClipModel.process_tokens` (sd1_clip.py)
+    only when the per-stream encode runs. Our node's per-stream chunking /
+    cutoff path appears to (in some workflows) consume or transform the
+    tokenized result before that warning would fire, so we proactively
+    detect the same condition by tokenizing the raw prompt text the same
+    way stock would (`clip.tokenize`) and inspecting the per-stream chunks
+    for tensor-typed token entries whose `shape[-1]` does not match that
+    stream's `embedding_size`.
+
+    Emits one `logging.warning` per mismatched embedding occurrence, using
+    the EXACT format string stock uses so existing user expectations and
+    log greps continue to work:
+        "WARNING: shape mismatch when trying to apply embedding,
+         embedding will be ignored {emb_dim} != {expected_dim}"
+    """
+    if clip_object_to_inspect is None or not prompt_text_to_scan_for_embedding_references:
+        return
+    try:
+        per_stream_tokenized_chunks_keyed_by_stream_name = clip_object_to_inspect.tokenize(
+            prompt_text_to_scan_for_embedding_references
+        )
+    except Exception:
+        return
+    if not isinstance(per_stream_tokenized_chunks_keyed_by_stream_name, dict):
+        return
+    top_level_tokenizer_object_or_none = getattr(clip_object_to_inspect, "tokenizer", None)
+    for stream_name_key, chunks_list_for_this_stream in per_stream_tokenized_chunks_keyed_by_stream_name.items():
+        if not isinstance(chunks_list_for_this_stream, list):
+            continue
+        per_stream_tokenizer_object_or_none = (
+            getattr(top_level_tokenizer_object_or_none, stream_name_key, None)
+            if top_level_tokenizer_object_or_none is not None
+            else None
+        )
+        expected_hidden_dim_for_this_stream = getattr(
+            per_stream_tokenizer_object_or_none, "embedding_size", None
+        )
+        if expected_hidden_dim_for_this_stream is None:
+            continue
+        for one_chunk_of_token_weight_pairs in chunks_list_for_this_stream:
+            if not isinstance(one_chunk_of_token_weight_pairs, list):
+                continue
+            for pair_in_chunk in one_chunk_of_token_weight_pairs:
+                if not isinstance(pair_in_chunk, (list, tuple)) or len(pair_in_chunk) < 1:
+                    continue
+                token_value_in_pair = pair_in_chunk[0]
+                if not isinstance(token_value_in_pair, torch.Tensor):
+                    continue
+                actual_embedding_hidden_dim = token_value_in_pair.shape[-1]
+                if actual_embedding_hidden_dim != expected_hidden_dim_for_this_stream:
+                    logging.warning(
+                        "WARNING: shape mismatch when trying to apply embedding, "
+                        "embedding will be ignored {} != {}".format(
+                            actual_embedding_hidden_dim,
+                            expected_hidden_dim_for_this_stream,
+                        )
+                    )
+
+
 def _collect_active_non_empty_sections_from_kwargs(kwargs_dict, active_section_count):
     active_section_descriptors_list = []
     for section_index in range(1, int(active_section_count) + 1):
@@ -470,6 +538,22 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         active_section_descriptors_list = _collect_active_non_empty_sections_from_kwargs(
             kwargs_for_individual_section_widget_values, section_count
         )
+
+        # Stock CLIPTextEncode emits a "shape mismatch when trying to apply
+        # embedding" WARNING when a referenced textual-inversion embedding's
+        # saved hidden-dim does not match a CLIP stream's expected hidden-dim
+        # (e.g. SD1.5 768-dim embedding used in an SDXL prompt). Stock then
+        # ignores that embedding and still produces an image. Our per-stream
+        # cutoff path sometimes does not surface this warning, which makes it
+        # look like the user supplied a working prompt when they actually
+        # didn't. Proactively scan every active section's text at entry and
+        # emit the same warning per mismatched embedding occurrence, before
+        # any encoding work runs.
+        for one_section_descriptor_to_scan_for_mismatched_embeddings in active_section_descriptors_list:
+            _emit_stock_style_shape_mismatch_warning_for_each_embedding_in_text_that_will_not_match_its_clip_stream_dim(
+                clip,
+                one_section_descriptor_to_scan_for_mismatched_embeddings["text"],
+            )
 
         # Resolve target W/H for the PRIMARY conditioning's SDXL metadata.
         primary_target_image_width, primary_target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
