@@ -31,8 +31,10 @@ defaulting to 1024x1024) is stamped onto every output entry.
 NO external plugin dependency. Self-contained.
 """
 
+import inspect
 import logging
 import re
+import sys
 
 import torch
 
@@ -45,10 +47,12 @@ DEFAULT_SECTION_COUNT_VALUE = 3
 CLIP_STREAM_PASS_BOTH_L_AND_G = "Pass L+G"
 CLIP_STREAM_PASS_L_ONLY = "Pass L"
 CLIP_STREAM_PASS_G_ONLY = "Pass G"
+CLIP_STREAM_PASS_CLASSIC_UPSTREAM_CUTOFF = "Classic"
 CLIP_STREAM_PASS_CHOICES_IN_DROPDOWN_ORDER = [
     CLIP_STREAM_PASS_BOTH_L_AND_G,
     CLIP_STREAM_PASS_L_ONLY,
     CLIP_STREAM_PASS_G_ONLY,
+    CLIP_STREAM_PASS_CLASSIC_UPSTREAM_CUTOFF,
 ]
 
 LATENT_TO_IMAGE_SPATIAL_SCALE_FACTOR = 8
@@ -63,6 +67,107 @@ OFFSET_MAXIMUM_VALUE = 1.0
 OFFSET_DEFAULT_VALUE = 0.0
 
 WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT = re.compile(r"\s+")
+
+
+# -------------- Classic mode: upstream ComfyUI_Cutoff plugin lookup --------------
+
+def _find_loaded_upstream_cutoff_module_in_sys_modules_or_none():
+    """
+    Locate the ComfyUI_Cutoff plugin's `cutoff` module by scanning sys.modules
+    for one that exposes the expected interface AS A REAL Python class +
+    callable function (to avoid matching torch._OpNamespace and friends whose
+    __getattr__ returns truthy for any name). Prefer modules whose name
+    contains "cutoff" (case-insensitive). Used ONLY when a section is marked
+    with the Classic clip_pass_choice — other modes use our self-contained
+    per-stream implementation.
+    """
+    matching_candidate_modules_keyed_by_name = {}
+    for module_name_in_sys_modules, loaded_module_object in list(sys.modules.items()):
+        if loaded_module_object is None:
+            continue
+        try:
+            finalize_attribute_or_none = getattr(loaded_module_object, "finalize_clip_regions", None)
+            base_prompt_attribute_or_none = getattr(loaded_module_object, "CLIPRegionsBasePrompt", None)
+        except Exception:
+            continue
+        if finalize_attribute_or_none is None or base_prompt_attribute_or_none is None:
+            continue
+        if not callable(finalize_attribute_or_none) or not inspect.isclass(base_prompt_attribute_or_none):
+            continue
+        matching_candidate_modules_keyed_by_name[module_name_in_sys_modules] = loaded_module_object
+    if not matching_candidate_modules_keyed_by_name:
+        return None
+    for candidate_module_name, candidate_module in matching_candidate_modules_keyed_by_name.items():
+        if "cutoff" in candidate_module_name.lower():
+            return candidate_module
+    return next(iter(matching_candidate_modules_keyed_by_name.values()))
+
+
+def _encode_one_group_via_classic_upstream_cutoff_plugin(
+    clip_object,
+    section_descriptors_in_classic_group_list,
+    join_separator_string,
+    mask_token_string,
+    strict_mask_value,
+    start_from_masked_value,
+):
+    """
+    Runs the upstream ComfyUI_Cutoff plugin directly for a group of sections
+    marked Classic. Mathematically identical to using the upstream plugin
+    standalone — for A/B comparison against our per-stream implementation.
+
+    Raises RuntimeError if the upstream plugin isn't installed.
+    """
+    upstream_cutoff_module = _find_loaded_upstream_cutoff_module_in_sys_modules_or_none()
+    if upstream_cutoff_module is None:
+        raise RuntimeError(
+            "CLIPTextEncodeWithCutoffRegionSeparation: Classic clip_pass_choice "
+            "requires the ComfyUI_Cutoff plugin to be installed (it's used as "
+            "the reference implementation for A/B comparison). Install from "
+            "https://github.com/BlenderNeko/ComfyUI_Cutoff into ComfyUI/custom_nodes/ "
+            "and restart ComfyUI. Other clip_pass_choice options (Pass L+G / Pass L / "
+            "Pass G) don't need it — they use our self-contained per-stream code."
+        )
+
+    classic_group_full_prompt_text = _build_full_prompt_text_for_one_group_of_sections(
+        section_descriptors_in_classic_group_list, join_separator_string
+    )
+
+    base_prompt_node_instance = upstream_cutoff_module.CLIPRegionsBasePrompt()
+    base_state_tuple_from_init_prompt = base_prompt_node_instance.init_prompt(
+        clip_object, classic_group_full_prompt_text
+    )
+    current_clip_regions_state = base_state_tuple_from_init_prompt[0]
+
+    add_region_node_instance = upstream_cutoff_module.CLIPSetRegion()
+    for section_descriptor_in_classic_group in section_descriptors_in_classic_group_list:
+        if not section_descriptor_in_classic_group["isolate"]:
+            continue
+        try:
+            next_state_tuple_after_region_add = add_region_node_instance.add_clip_region(
+                current_clip_regions_state,
+                section_descriptor_in_classic_group["text"],
+                section_descriptor_in_classic_group["text"],
+                section_descriptor_in_classic_group["weight"],
+            )
+            current_clip_regions_state = next_state_tuple_after_region_add[0]
+        except Exception as upstream_cutoff_register_region_exception:
+            logging.warning(
+                "CLIPTextEncodeWithCutoffRegionSeparation (Classic): skipped isolate "
+                f"registration for section text {section_descriptor_in_classic_group['text']!r} "
+                f"(upstream Cutoff raised {type(upstream_cutoff_register_region_exception).__name__}: "
+                f"{upstream_cutoff_register_region_exception})."
+            )
+
+    finalize_return_tuple_from_upstream_cutoff = upstream_cutoff_module.finalize_clip_regions(
+        current_clip_regions_state,
+        mask_token_string,
+        float(strict_mask_value),
+        float(start_from_masked_value),
+    )
+    # Upstream returns a CONDITIONING list. For Classic we just take that list
+    # as-is and let the caller stamp SDXL size/crop metadata onto each entry.
+    return finalize_return_tuple_from_upstream_cutoff[0]
 
 
 # -------------- section collection --------------
@@ -389,17 +494,38 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         per_group_full_prompt_text_for_reference_display = []
         for clip_pass_choice_for_this_group, section_descriptors_in_this_group in grouped_sections_by_clip_pass_choice.items():
             try:
-                group_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
-                    clip,
-                    section_descriptors_in_this_group,
-                    clip_pass_choice_for_this_group,
-                    join_separator,
-                    mask_token,
-                    float(strict_mask),
-                    float(start_from_masked),
-                )
-                group_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
-                output_conditioning_entries_combined_across_groups.append(group_conditioning_entry)
+                if clip_pass_choice_for_this_group == CLIP_STREAM_PASS_CLASSIC_UPSTREAM_CUTOFF:
+                    # Classic group: route through the upstream ComfyUI_Cutoff
+                    # plugin directly. Mathematically identical to using the
+                    # upstream plugin standalone — for A/B comparison.
+                    classic_group_conditioning_list = _encode_one_group_via_classic_upstream_cutoff_plugin(
+                        clip,
+                        section_descriptors_in_this_group,
+                        join_separator,
+                        mask_token,
+                        float(strict_mask),
+                        float(start_from_masked),
+                    )
+                    for classic_group_entry in classic_group_conditioning_list:
+                        classic_group_entry_tokens_tensor = classic_group_entry[0]
+                        classic_group_entry_metadata_dict = dict(classic_group_entry[1])
+                        classic_group_entry_metadata_dict.update(sdxl_size_and_crop_metadata_fields)
+                        output_conditioning_entries_combined_across_groups.append(
+                            [classic_group_entry_tokens_tensor, classic_group_entry_metadata_dict]
+                        )
+                else:
+                    # L+G / L / G groups: use our self-contained per-stream code.
+                    group_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
+                        clip,
+                        section_descriptors_in_this_group,
+                        clip_pass_choice_for_this_group,
+                        join_separator,
+                        mask_token,
+                        float(strict_mask),
+                        float(start_from_masked),
+                    )
+                    group_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
+                    output_conditioning_entries_combined_across_groups.append(group_conditioning_entry)
             except Exception as group_encoding_failure:
                 logging.warning(
                     f"CLIPTextEncodeWithCutoffRegionSeparation: group '{clip_pass_choice_for_this_group}' "

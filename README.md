@@ -420,12 +420,21 @@ not zero-masking).
   Default `weight = 1.0` produces the same effect either way: bare text,
   no region weight, no attention wrap.
 
-- `section_N_clip` (dropdown: `Pass L+G` / `Pass L` / `Pass G`, default
-  `Pass L+G`) — which SDXL CLIP stream(s) this section's tokens contribute
-  to. Sections sharing a stream choice get grouped into one Cutoff pass.
-  Pass L = zero the G portion of the resulting tensor + zero pooled_output.
-  Pass G = zero the L portion. Non-SDXL conditioning (last dim != 2048)
-  passes through unchanged regardless of this setting.
+- `section_N_clip` (dropdown: `Pass L+G` / `Pass L` / `Pass G` / `Classic`,
+  default `Pass L+G`) — which SDXL CLIP stream(s) this section's tokens
+  contribute to. Sections sharing a choice get grouped into one encoding
+  pass.
+  - **`Pass L+G`**: section's text goes to both CLIP-L and CLIP-G via our
+    self-contained per-stream Cutoff impl (no external dep).
+  - **`Pass L`**: section's text goes to CLIP-L only; CLIP-G for the
+    section's group is the empty prompt (natural CLIP-G empty embedding,
+    NOT zero-masking — this is in-distribution for SDXL).
+  - **`Pass G`**: symmetric.
+  - **`Classic`**: routes through the upstream
+    [ComfyUI_Cutoff](https://github.com/BlenderNeko/ComfyUI_Cutoff) plugin
+    directly. Mathematically identical to using the upstream plugin
+    standalone. Provided for A/B comparison against our per-stream impl.
+    **Requires ComfyUI_Cutoff to be installed** — other modes don't.
 
 - `zoom` (FLOAT min 1.0, default 1.0) — SDXL "source frame larger than
   rendered frame" zoom bias. Same semantics as the standalone
