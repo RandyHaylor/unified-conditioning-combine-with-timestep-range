@@ -423,18 +423,30 @@ not zero-masking).
 - `section_N_clip` (dropdown: `Pass L+G` / `Pass L` / `Pass G` / `Classic`,
   default `Pass L+G`) — which SDXL CLIP stream(s) this section's tokens
   contribute to. Sections sharing a choice get grouped into one encoding
-  pass.
-  - **`Pass L+G`**: section's text goes to both CLIP-L and CLIP-G via our
-    self-contained per-stream Cutoff impl (no external dep).
+  pass. You can mix modes within one node — e.g., two sections Classic
+  + one section Pass L — they are encoded by their respective code paths
+  and combined into a multi-entry parallel-branch CONDITIONING.
+  - **`Pass L+G`** (default): section's text goes to both CLIP-L and CLIP-G
+    via our self-contained per-stream Cutoff implementation. No external
+    plugin dependency. Verified in testing to produce equivalent quality
+    to (and in some cases observably better than) the upstream Cutoff
+    plugin's output for the common single-prompt case.
   - **`Pass L`**: section's text goes to CLIP-L only; CLIP-G for the
-    section's group is the empty prompt (natural CLIP-G empty embedding,
-    NOT zero-masking — this is in-distribution for SDXL).
-  - **`Pass G`**: symmetric.
+    section's group is encoded as the empty prompt (giving CLIP-G's
+    natural empty-prompt embedding — NOT a zero-masked tensor, which
+    would be out-of-distribution for SDXL). Use to route tag-style or
+    short prompts to L while leaving G's natural baseline intact.
+  - **`Pass G`**: symmetric — section's text goes to CLIP-G only;
+    CLIP-L encodes the empty prompt. Useful for long natural-language
+    prompts that the larger CLIP-G encoder handles better.
   - **`Classic`**: routes through the upstream
     [ComfyUI_Cutoff](https://github.com/BlenderNeko/ComfyUI_Cutoff) plugin
-    directly. Mathematically identical to using the upstream plugin
-    standalone. Provided for A/B comparison against our per-stream impl.
-    **Requires ComfyUI_Cutoff to be installed** — other modes don't.
+    directly. Verified to reproduce the upstream plugin's exact behavior
+    when used standalone (since this mode IS the upstream plugin's code).
+    Use when you want the canonical Cutoff behavior, or for side-by-side
+    comparison against the Pass L+G / L / G modes. **Requires
+    ComfyUI_Cutoff to be installed** — the other three modes have no
+    external dependency.
 
 - `zoom` (FLOAT min 1.0, default 1.0) — SDXL "source frame larger than
   rendered frame" zoom bias. Same semantics as the standalone
