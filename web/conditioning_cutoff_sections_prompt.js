@@ -1,15 +1,20 @@
 // Frontend extension for ConditioningCutoffSectionsPrompt.
 //
-// Hides section_N_text / section_N_isolate widget pairs whose index N is
-// greater than the current `section_count` widget value. The hidden widgets
-// stay in `node.widgets[]` (so their values still serialize to / restore
-// from widgets_values), they just render at zero height.
+// Hides section_N_text / section_N_isolate / section_N_weight widget triples
+// whose index N is greater than the current `section_count` widget value.
+// The hidden widgets stay in `node.widgets[]` (so their values still serialize
+// to / restore from widgets_values), they just render at zero height.
 //
-// On change of section_count, on node creation, and on configure (workflow
-// load), visibility is recomputed.
-//
-// Depends only on ComfyUI core (`../../scripts/app.js`) and LiteGraph core
-// methods (`computeSize` override, `setDirtyCanvas`).
+// Pattern adopted from comfyui-easy-use's toggleWidget at
+//   custom_nodes/comfyui-easy-use/web_version/v1/js/common/utils.js:89-103
+// Key bits:
+//   - Cache widget.type + widget.computeSize on first hide so they can be
+//     restored on show.
+//   - Capture node.size BEFORE applying the toggle.
+//   - On show: height = max(node.computeSize()[1], origSize[1])  -> grows.
+//     On hide: height = node.size[1]                              -> stable.
+//   - Always call node.setSize([node.size[0], height]) inside the toggle.
+//   - After all toggles for one update pass, call updateNodeHeight once.
 
 import { app } from "../../scripts/app.js";
 
@@ -17,63 +22,12 @@ const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "ConditioningCutoffSectionsPrompt";
 
 const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight)$/;
 
-const HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT = -4;
+const HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX = "cutoffSectionsHidden:";
 
-// ComfyUI's frontend treats widgets whose type starts with "converted-widget"
-// as the special "convert-to-input" hidden state, which is the canonical
-// way to make BOTH the canvas widget AND its DOM companion (textarea / input
-// element for STRING multiline / FLOAT widgets) disappear. Setting
-// `type = "hidden"` alone is NOT recognized by ComfyUI's renderer and lets
-// the DOM element keep rendering off-position.
-const CONVERTED_HIDDEN_WIDGET_TYPE_SENTINEL = "converted-widget";
-
-function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
-  if (!widget_to_show_or_hide) return;
-  // Two things to hide / show:
-  //   (a) the canvas-drawn widget (controlled via computeSize + type)
-  //   (b) the DOM element ComfyUI may have inserted for STRING multiline /
-  //       FLOAT / etc. widgets — these are positioned outside the canvas
-  //       and ignore the computeSize trick, so they'd "hang off" the node
-  //       bottom when hidden.
-  if (should_be_hidden) {
-    if (widget_to_show_or_hide.__cutoff_original_compute_size === undefined) {
-      widget_to_show_or_hide.__cutoff_original_compute_size = widget_to_show_or_hide.computeSize;
-      widget_to_show_or_hide.__cutoff_original_type = widget_to_show_or_hide.type;
-      widget_to_show_or_hide.__cutoff_original_serialize_value_function = widget_to_show_or_hide.serializeValue;
-    }
-    widget_to_show_or_hide.computeSize = function () {
-      return [0, HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT];
-    };
-    // Sentinel type telling ComfyUI's renderer to skip drawing AND to hide
-    // the DOM companion (textarea / input). Append a per-widget suffix so
-    // each hidden widget is distinguishable in the renderer's bookkeeping,
-    // matching the comfy-mtb hideWidget pattern.
-    widget_to_show_or_hide.type = CONVERTED_HIDDEN_WIDGET_TYPE_SENTINEL + ":" + widget_to_show_or_hide.name;
-    widget_to_show_or_hide.hidden = true;
-    // Preserve the underlying value during hide via a serializeValue that
-    // returns the value-as-was; this keeps the value in widgets_values on
-    // save so re-expand picks up the same text.
-    const original_serialize_function_at_hide_time = widget_to_show_or_hide.__cutoff_original_serialize_value_function;
-    widget_to_show_or_hide.serializeValue = function () {
-      if (original_serialize_function_at_hide_time) {
-        return original_serialize_function_at_hide_time.apply(this, arguments);
-      }
-      return widget_to_show_or_hide.value;
-    };
-  } else {
-    if (widget_to_show_or_hide.__cutoff_original_compute_size !== undefined) {
-      widget_to_show_or_hide.computeSize = widget_to_show_or_hide.__cutoff_original_compute_size;
-      widget_to_show_or_hide.type = widget_to_show_or_hide.__cutoff_original_type;
-      if (widget_to_show_or_hide.__cutoff_original_serialize_value_function !== undefined) {
-        widget_to_show_or_hide.serializeValue = widget_to_show_or_hide.__cutoff_original_serialize_value_function;
-      }
-      widget_to_show_or_hide.__cutoff_original_compute_size = undefined;
-      widget_to_show_or_hide.__cutoff_original_type = undefined;
-      widget_to_show_or_hide.__cutoff_original_serialize_value_function = undefined;
-    }
-    widget_to_show_or_hide.hidden = false;
-  }
-}
+// One global cache keyed by widget.name. The widget objects themselves get
+// re-created on workflow load, so storing the originals on the widget would
+// not survive a configure pass.
+const original_widget_props_cache_by_widget_name = {};
 
 function findWidgetByNameOnNodeOrUndefined(node, widget_name_to_find) {
   if (!node.widgets) return undefined;
@@ -83,6 +37,44 @@ function findWidgetByNameOnNodeOrUndefined(node, widget_name_to_find) {
     }
   }
   return undefined;
+}
+
+function toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(node, widget_to_toggle, should_be_visible) {
+  if (!widget_to_toggle) return;
+
+  // Cache the original type + computeSize ONCE per widget name.
+  if (!original_widget_props_cache_by_widget_name[widget_to_toggle.name]) {
+    original_widget_props_cache_by_widget_name[widget_to_toggle.name] = {
+      original_type: widget_to_toggle.type,
+      original_compute_size_function: widget_to_toggle.computeSize,
+    };
+  }
+  const cached_original_props_for_this_widget = original_widget_props_cache_by_widget_name[widget_to_toggle.name];
+
+  const node_size_captured_before_this_toggle = [node.size[0], node.size[1]];
+
+  if (should_be_visible) {
+    widget_to_toggle.type = cached_original_props_for_this_widget.original_type;
+    widget_to_toggle.computeSize = cached_original_props_for_this_widget.original_compute_size_function;
+  } else {
+    widget_to_toggle.type = HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX + widget_to_toggle.name;
+    widget_to_toggle.computeSize = function () {
+      return [0, -4];
+    };
+  }
+
+  // On show: grow the node to fit the now-visible widgets. On hide: keep
+  // current node size (let the user shrink manually if they want).
+  const new_height_for_node_after_this_toggle = should_be_visible
+    ? Math.max(node.computeSize()[1], node_size_captured_before_this_toggle[1])
+    : node.size[1];
+  node.setSize([node.size[0], new_height_for_node_after_this_toggle]);
+}
+
+function forceFinalNodeHeightRelayoutToFitVisibleWidgets(node) {
+  // Equivalent of comfyui-easy-use's updateNodeHeight. Recomputes from
+  // current widget visibility state.
+  node.setSize([node.size[0], node.computeSize()[1]]);
 }
 
 function updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node) {
@@ -96,19 +88,12 @@ function updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node) {
     const regex_match_for_section_widget_name = widget_descriptor.name.match(SECTION_WIDGET_NAME_REGEX);
     if (!regex_match_for_section_widget_name) continue;
     const this_widget_section_index = parseInt(regex_match_for_section_widget_name[1], 10);
-    setVisibilityOfOneWidget(widget_descriptor, this_widget_section_index > current_section_count_value);
+    const this_widget_should_be_visible = this_widget_section_index <= current_section_count_value;
+    toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(
+      node, widget_descriptor, this_widget_should_be_visible
+    );
   }
-  // Resize the node to fit the new widget layout. Use the canonical
-  // setSize([max_width, new_height]) pattern (matches comfy-mtb's
-  // convertToWidget at comfy_shared.js:171) so LiteGraph re-lays-out
-  // widgets correctly — direct mutation of node.size[1] doesn't
-  // trigger the relayout that newly-visible widgets need.
-  if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
-    const min_size_for_currently_visible_widgets = node.computeSize();
-    const new_width_preserving_user_drag = Math.max(node.size[0], min_size_for_currently_visible_widgets[0]);
-    const new_height_to_fit_visible_widgets = min_size_for_currently_visible_widgets[1];
-    node.setSize([new_width_preserving_user_drag, new_height_to_fit_visible_widgets]);
-  }
+  forceFinalNodeHeightRelayoutToFitVisibleWidgets(node);
   node.setDirtyCanvas(true, true);
 }
 
@@ -125,7 +110,7 @@ app.registerExtension({
         : undefined;
 
       // Wrap the section_count widget's callback so visibility updates
-      // whenever the value changes.
+      // whenever the user changes it.
       const section_count_widget = findWidgetByNameOnNodeOrUndefined(this, "section_count");
       if (section_count_widget) {
         const previous_section_count_widget_callback = section_count_widget.callback;
@@ -140,9 +125,8 @@ app.registerExtension({
       }
 
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
-      // DOM elements for multiline STRING / FLOAT widgets are sometimes
-      // inserted asynchronously after onNodeCreated returns. Run a second
-      // pass next tick so the DOM hide also gets applied.
+      // DOM elements may be inserted asynchronously after onNodeCreated.
+      // A deferred second pass catches that case.
       const node_reference_for_deferred_update = this;
       setTimeout(function () {
         updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node_reference_for_deferred_update);
@@ -156,15 +140,20 @@ app.registerExtension({
         ? original_on_configure_function.apply(this, arguments)
         : undefined;
       // After workflow load, refresh visibility from the restored
-      // section_count widget value.
+      // section_count widget value. The original widget objects have been
+      // replaced, so the cache may have stale entries; allow re-caching
+      // by clearing cached entries for THIS node's widgets.
+      for (const widget_descriptor of this.widgets || []) {
+        if (widget_descriptor && widget_descriptor.name) {
+          delete original_widget_props_cache_by_widget_name[widget_descriptor.name];
+        }
+      }
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       return original_on_configure_return_value;
     };
 
-    // ComfyUI fires node.onWidgetChanged when any widget's value changes.
-    // Hooking it as a second path (in addition to wrapping section_count's
-    // callback) makes the update fire reliably even if the callback wrap
-    // is bypassed by some widget implementations.
+    // Second wire so the update fires even if some widget implementations
+    // bypass the wrapped callback.
     const original_on_widget_changed_function = nodeType.prototype.onWidgetChanged;
     nodeType.prototype.onWidgetChanged = function (changed_widget_name, _new_widget_value, _old_widget_value, _changed_widget) {
       const original_on_widget_changed_return_value = original_on_widget_changed_function
