@@ -109,7 +109,7 @@ class ConditioningCutoffSectionsPrompt:
                 "max": MAX_SECTION_COUNT_SUPPORTED,
                 "step": 1,
             }),
-            "join_separator": ("STRING", {"multiline": False, "default": "\n"}),
+            "join_separator": ("STRING", {"multiline": False, "default": ","}),
             "mask_token": ("STRING", {"multiline": False, "default": ""}),
             "strict_mask": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
             "start_from_masked": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),

@@ -374,9 +374,10 @@ raises a clear runtime error pointing you to the install link.
   active. Section widgets with index > section_count are hidden in the UI
   (their values still persist in the workflow JSON, so you can re-expand
   without losing typed text).
-- `join_separator` (STRING, default `"\n"`) — how the active sections are
-  joined into the full prompt text that CLIP sees. `\n` matches Cutoff's
-  natural per-line region convention.
+- `join_separator` (STRING, default `","`) — how the active sections are
+  joined into the full prompt text that CLIP sees. Comma is the default
+  CLIP tag separator; switch to `\n` if you want per-line regions
+  (which is also a natural Cutoff boundary).
 - `mask_token` (STRING, default `""`) — passed through to Cutoff's finalize.
 - `strict_mask` (FLOAT 0..1, default `1.0`) — Cutoff strictness.
   `1.0` = each isolated phrase only affects its own region;
