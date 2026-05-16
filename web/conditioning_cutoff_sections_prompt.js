@@ -114,6 +114,17 @@ function updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node) {
   );
   for (const widget_descriptor of node.widgets || []) {
     if (!widget_descriptor || !widget_descriptor.name) continue;
+    // Always hide the mask_token widget. The value stays at its default
+    // (empty string) and the Python side reads it from kwargs as usual.
+    // Cutoff treats empty mask_token as the default end-of-text token,
+    // which is what we want for phrase-level decontamination, so there's
+    // no reason to expose it in the UI.
+    if (widget_descriptor.name === "mask_token") {
+      toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(
+        node, widget_descriptor, false
+      );
+      continue;
+    }
     const regex_match_for_section_widget_name = widget_descriptor.name.match(SECTION_WIDGET_NAME_REGEX);
     if (!regex_match_for_section_widget_name) continue;
     const this_widget_section_index = parseInt(regex_match_for_section_widget_name[1], 10);
