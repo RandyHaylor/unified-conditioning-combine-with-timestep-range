@@ -19,6 +19,14 @@ const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight)$/;
 
 const HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT = -4;
 
+// ComfyUI's frontend treats widgets whose type starts with "converted-widget"
+// as the special "convert-to-input" hidden state, which is the canonical
+// way to make BOTH the canvas widget AND its DOM companion (textarea / input
+// element for STRING multiline / FLOAT widgets) disappear. Setting
+// `type = "hidden"` alone is NOT recognized by ComfyUI's renderer and lets
+// the DOM element keep rendering off-position.
+const CONVERTED_HIDDEN_WIDGET_TYPE_SENTINEL = "converted-widget";
+
 function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
   if (!widget_to_show_or_hide) return;
   // Two things to hide / show:
@@ -31,43 +39,39 @@ function setVisibilityOfOneWidget(widget_to_show_or_hide, should_be_hidden) {
     if (widget_to_show_or_hide.__cutoff_original_compute_size === undefined) {
       widget_to_show_or_hide.__cutoff_original_compute_size = widget_to_show_or_hide.computeSize;
       widget_to_show_or_hide.__cutoff_original_type = widget_to_show_or_hide.type;
+      widget_to_show_or_hide.__cutoff_original_serialize_value_function = widget_to_show_or_hide.serializeValue;
     }
     widget_to_show_or_hide.computeSize = function () {
       return [0, HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT];
     };
-    widget_to_show_or_hide.type = "hidden";
-    // DOM-rendered companions:
-    const dom_element_candidates_to_hide = [
-      widget_to_show_or_hide.element,
-      widget_to_show_or_hide.inputEl,
-      widget_to_show_or_hide.input,
-    ];
-    for (const dom_element of dom_element_candidates_to_hide) {
-      if (dom_element && dom_element.style !== undefined) {
-        if (widget_to_show_or_hide.__cutoff_original_dom_display === undefined) {
-          widget_to_show_or_hide.__cutoff_original_dom_display = dom_element.style.display || "";
-        }
-        dom_element.style.display = "none";
+    // Sentinel type telling ComfyUI's renderer to skip drawing AND to hide
+    // the DOM companion (textarea / input). Append a per-widget suffix so
+    // each hidden widget is distinguishable in the renderer's bookkeeping,
+    // matching the comfy-mtb hideWidget pattern.
+    widget_to_show_or_hide.type = CONVERTED_HIDDEN_WIDGET_TYPE_SENTINEL + ":" + widget_to_show_or_hide.name;
+    widget_to_show_or_hide.hidden = true;
+    // Preserve the underlying value during hide via a serializeValue that
+    // returns the value-as-was; this keeps the value in widgets_values on
+    // save so re-expand picks up the same text.
+    const original_serialize_function_at_hide_time = widget_to_show_or_hide.__cutoff_original_serialize_value_function;
+    widget_to_show_or_hide.serializeValue = function () {
+      if (original_serialize_function_at_hide_time) {
+        return original_serialize_function_at_hide_time.apply(this, arguments);
       }
-    }
+      return widget_to_show_or_hide.value;
+    };
   } else {
     if (widget_to_show_or_hide.__cutoff_original_compute_size !== undefined) {
       widget_to_show_or_hide.computeSize = widget_to_show_or_hide.__cutoff_original_compute_size;
       widget_to_show_or_hide.type = widget_to_show_or_hide.__cutoff_original_type;
+      if (widget_to_show_or_hide.__cutoff_original_serialize_value_function !== undefined) {
+        widget_to_show_or_hide.serializeValue = widget_to_show_or_hide.__cutoff_original_serialize_value_function;
+      }
       widget_to_show_or_hide.__cutoff_original_compute_size = undefined;
       widget_to_show_or_hide.__cutoff_original_type = undefined;
+      widget_to_show_or_hide.__cutoff_original_serialize_value_function = undefined;
     }
-    const dom_element_candidates_to_show = [
-      widget_to_show_or_hide.element,
-      widget_to_show_or_hide.inputEl,
-      widget_to_show_or_hide.input,
-    ];
-    for (const dom_element of dom_element_candidates_to_show) {
-      if (dom_element && dom_element.style !== undefined) {
-        dom_element.style.display = widget_to_show_or_hide.__cutoff_original_dom_display || "";
-      }
-    }
-    widget_to_show_or_hide.__cutoff_original_dom_display = undefined;
+    widget_to_show_or_hide.hidden = false;
   }
 }
 
