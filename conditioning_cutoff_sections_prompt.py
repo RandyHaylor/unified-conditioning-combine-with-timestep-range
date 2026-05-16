@@ -112,10 +112,37 @@ def _collect_active_non_empty_sections_from_kwargs(kwargs_dict, active_section_c
     return active_section_descriptors_list
 
 
+def _build_effective_per_section_prompt_text_with_optional_clip_attention_weight_wrap(section_descriptor):
+    """
+    Returns the prompt text fragment to put into the full prompt for this
+    one section.
+
+    Rule:
+      isolate=True   → return bare text. The weight is applied via Cutoff's
+                       add_clip_region weight parameter (later). Wrapping
+                       here too would double-apply the weight.
+      isolate=False  → if weight is 1.0 (or close to it), return bare text.
+                       Otherwise wrap in CLIP's `(text:weight)` attention
+                       syntax so the weight has an effect even though we
+                       won't register a Cutoff region for this section.
+    """
+    section_bare_text = section_descriptor["text"]
+    if section_descriptor["isolate"]:
+        return section_bare_text
+    section_weight_value = section_descriptor["weight"]
+    if abs(section_weight_value - 1.0) < 1e-9:
+        return section_bare_text
+    return f"({section_bare_text}:{section_weight_value:.3f})"
+
+
 def _build_full_prompt_text_from_section_descriptors_using_separator(
     section_descriptors_list, join_separator_string
 ):
-    return join_separator_string.join(descriptor["text"] for descriptor in section_descriptors_list)
+    per_section_effective_prompt_text_fragments = [
+        _build_effective_per_section_prompt_text_with_optional_clip_attention_weight_wrap(section_descriptor)
+        for section_descriptor in section_descriptors_list
+    ]
+    return join_separator_string.join(per_section_effective_prompt_text_fragments)
 
 
 def _build_populated_cutoff_clip_regions_state_with_isolated_sections_registered(
