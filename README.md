@@ -455,7 +455,26 @@ not zero-masking).
   rendered frame inside the implied larger source. -1 = far left/top,
   +1 = far right/bottom.
 - `latent` (LATENT, optional) — read for image-space W/H to use as the
-  SDXL target size. If unconnected, defaults to 1024×1024.
+  SDXL target size for the primary `conditioning` output. If unconnected,
+  defaults to 1024×1024.
+- `upscaled_latent` (LATENT, optional) — same idea but for the
+  `upscaled_conditioning` output. If unconnected or same W/H as `latent`,
+  the `upscaled_conditioning` output is identical to the primary
+  `conditioning` output (so wiring it through a second sampler is
+  harmless). When `upscaled_latent` has different W/H, a separate
+  SDXL size/crop metadata block is computed using those dimensions and
+  stamped on the upscaled output entries.
+
+Outputs:
+- `conditioning` (CONDITIONING) — primary, sized to `latent`'s W/H.
+- `upscaled_conditioning` (CONDITIONING) — same prompt encoding, sized to
+  `upscaled_latent`'s W/H (or identical to primary if no/same upscale).
+- `reference_full_prompt` (STRING) — debug dump of per-group prompts.
+
+This lets a single prompt node drive a **two-stage workflow** (base
+sampler at one resolution, then a hires-fix / upscaler sampler at a
+larger resolution) without having to maintain two copies of the same
+prompt with slightly different target sizes.
 
 Outputs:
 - `conditioning` (CONDITIONING) — finalized through Cutoff; wire to a sampler.

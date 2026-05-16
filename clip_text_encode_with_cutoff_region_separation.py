@@ -436,11 +436,12 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
             "required": required_inputs_dict,
             "optional": {
                 "latent": ("LATENT",),
+                "upscaled_latent": ("LATENT",),
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING", "STRING")
-    RETURN_NAMES = ("conditioning", "reference_full_prompt")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("conditioning", "upscaled_conditioning", "reference_full_prompt")
     FUNCTION = "encode_with_grouped_per_stream_cutoff_and_sdxl_zoom"
     CATEGORY = "unified-conditioning-merge"
 
@@ -456,90 +457,129 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         offset_x,
         offset_y,
         latent=None,
+        upscaled_latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
         active_section_descriptors_list = _collect_active_non_empty_sections_from_kwargs(
             kwargs_for_individual_section_widget_values, section_count
         )
 
-        target_image_width, target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
+        # Resolve target W/H for the PRIMARY conditioning's SDXL metadata.
+        primary_target_image_width, primary_target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
+        # Resolve target W/H for the UPSCALED conditioning's SDXL metadata.
+        # If upscaled_latent is not connected, fall back to the primary
+        # target W/H so the upscaled output is identical to the primary
+        # (the user can still wire it through a second sampler that
+        # produces the same image as the first — harmless).
+        upscaled_target_image_width, upscaled_target_image_height = _resolve_target_image_width_and_height_from_optional_latent_or_defaults(upscaled_latent)
+        if upscaled_latent is None:
+            upscaled_target_image_width = primary_target_image_width
+            upscaled_target_image_height = primary_target_image_height
+
         zoom_factor_clamped = max(ZOOM_MINIMUM_VALUE, float(zoom))
         offset_x_clamped = _clamp_numeric_value_inclusive(float(offset_x), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE)
         offset_y_clamped = _clamp_numeric_value_inclusive(float(offset_y), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE)
-        sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields(
-            target_image_width, target_image_height, zoom_factor_clamped, offset_x_clamped, offset_y_clamped
+        primary_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields(
+            primary_target_image_width, primary_target_image_height,
+            zoom_factor_clamped, offset_x_clamped, offset_y_clamped,
         )
+        upscaled_targets_differ_from_primary = (
+            upscaled_target_image_width != primary_target_image_width
+            or upscaled_target_image_height != primary_target_image_height
+        )
+        if upscaled_targets_differ_from_primary:
+            upscaled_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields(
+                upscaled_target_image_width, upscaled_target_image_height,
+                zoom_factor_clamped, offset_x_clamped, offset_y_clamped,
+            )
+        else:
+            upscaled_sdxl_size_and_crop_metadata_fields = primary_sdxl_size_and_crop_metadata_fields
+
+        # Encode once (expensive part); we'll stamp two different SDXL
+        # metadata dicts onto separate copies of each raw entry to build
+        # the primary and upscaled outputs.
+        raw_conditioning_entries_collected_across_all_groups = []
+        per_group_full_prompt_text_for_reference_display = []
 
         if not active_section_descriptors_list:
-            # Encode empty prompt and return single empty entry.
+            # Encode empty prompt and stamp into a single entry per output.
             try:
                 empty_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
                     clip, [], CLIP_STREAM_PASS_BOTH_L_AND_G, join_separator,
                     mask_token, float(strict_mask), float(start_from_masked),
                 )
-                empty_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
-                return ([empty_conditioning_entry], "")
+                raw_conditioning_entries_collected_across_all_groups.append(empty_conditioning_entry)
             except Exception as encoding_failure_for_empty_prompt:
                 logging.warning(
                     f"CLIPTextEncodeWithCutoffRegionSeparation: empty-prompt encode failed: "
                     f"{encoding_failure_for_empty_prompt}"
                 )
-                return ([], "")
+                return ([], [], "")
+        else:
+            grouped_sections_by_clip_pass_choice = _group_active_sections_by_their_clip_pass_choice(
+                active_section_descriptors_list
+            )
 
-        grouped_sections_by_clip_pass_choice = _group_active_sections_by_their_clip_pass_choice(
-            active_section_descriptors_list
-        )
-
-        output_conditioning_entries_combined_across_groups = []
-        per_group_full_prompt_text_for_reference_display = []
-        for clip_pass_choice_for_this_group, section_descriptors_in_this_group in grouped_sections_by_clip_pass_choice.items():
-            try:
-                if clip_pass_choice_for_this_group == CLIP_STREAM_PASS_CLASSIC_UPSTREAM_CUTOFF:
-                    # Classic group: route through the upstream ComfyUI_Cutoff
-                    # plugin directly. Mathematically identical to using the
-                    # upstream plugin standalone — for A/B comparison.
-                    classic_group_conditioning_list = _encode_one_group_via_classic_upstream_cutoff_plugin(
-                        clip,
-                        section_descriptors_in_this_group,
-                        join_separator,
-                        mask_token,
-                        float(strict_mask),
-                        float(start_from_masked),
-                    )
-                    for classic_group_entry in classic_group_conditioning_list:
-                        classic_group_entry_tokens_tensor = classic_group_entry[0]
-                        classic_group_entry_metadata_dict = dict(classic_group_entry[1])
-                        classic_group_entry_metadata_dict.update(sdxl_size_and_crop_metadata_fields)
-                        output_conditioning_entries_combined_across_groups.append(
-                            [classic_group_entry_tokens_tensor, classic_group_entry_metadata_dict]
+            for clip_pass_choice_for_this_group, section_descriptors_in_this_group in grouped_sections_by_clip_pass_choice.items():
+                try:
+                    if clip_pass_choice_for_this_group == CLIP_STREAM_PASS_CLASSIC_UPSTREAM_CUTOFF:
+                        classic_group_conditioning_list = _encode_one_group_via_classic_upstream_cutoff_plugin(
+                            clip,
+                            section_descriptors_in_this_group,
+                            join_separator,
+                            mask_token,
+                            float(strict_mask),
+                            float(start_from_masked),
                         )
-                else:
-                    # L+G / L / G groups: use our self-contained per-stream code.
-                    group_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
-                        clip,
-                        section_descriptors_in_this_group,
-                        clip_pass_choice_for_this_group,
-                        join_separator,
-                        mask_token,
-                        float(strict_mask),
-                        float(start_from_masked),
+                        for classic_group_entry in classic_group_conditioning_list:
+                            raw_conditioning_entries_collected_across_all_groups.append(classic_group_entry)
+                    else:
+                        group_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
+                            clip,
+                            section_descriptors_in_this_group,
+                            clip_pass_choice_for_this_group,
+                            join_separator,
+                            mask_token,
+                            float(strict_mask),
+                            float(start_from_masked),
+                        )
+                        raw_conditioning_entries_collected_across_all_groups.append(group_conditioning_entry)
+                except Exception as group_encoding_failure:
+                    logging.warning(
+                        f"CLIPTextEncodeWithCutoffRegionSeparation: group '{clip_pass_choice_for_this_group}' "
+                        f"encoding failed: {type(group_encoding_failure).__name__}: {group_encoding_failure}. "
+                        f"Skipping this group."
                     )
-                    group_conditioning_entry[1].update(sdxl_size_and_crop_metadata_fields)
-                    output_conditioning_entries_combined_across_groups.append(group_conditioning_entry)
-            except Exception as group_encoding_failure:
-                logging.warning(
-                    f"CLIPTextEncodeWithCutoffRegionSeparation: group '{clip_pass_choice_for_this_group}' "
-                    f"encoding failed: {type(group_encoding_failure).__name__}: {group_encoding_failure}. "
-                    f"Skipping this group."
-                )
-                continue
+                    continue
 
-            full_prompt_text_for_this_group_display = _build_full_prompt_text_for_one_group_of_sections(
-                section_descriptors_in_this_group, join_separator
-            )
-            per_group_full_prompt_text_for_reference_display.append(
-                f"[{clip_pass_choice_for_this_group}] {full_prompt_text_for_this_group_display}"
-            )
+                full_prompt_text_for_this_group_display = _build_full_prompt_text_for_one_group_of_sections(
+                    section_descriptors_in_this_group, join_separator
+                )
+                per_group_full_prompt_text_for_reference_display.append(
+                    f"[{clip_pass_choice_for_this_group}] {full_prompt_text_for_this_group_display}"
+                )
+
+        # Build the two output CONDITIONING lists by stamping each raw entry
+        # with the respective SDXL metadata dict. Tokens tensors are shared
+        # by reference (not deep-copied) — only the metadata dict is
+        # rebuilt per output.
+        primary_output_conditioning_entries = []
+        upscaled_output_conditioning_entries = []
+        for raw_conditioning_entry in raw_conditioning_entries_collected_across_all_groups:
+            raw_entry_tokens_tensor = raw_conditioning_entry[0]
+            raw_entry_metadata_dict_unstamped = raw_conditioning_entry[1]
+
+            primary_entry_metadata_dict = dict(raw_entry_metadata_dict_unstamped)
+            primary_entry_metadata_dict.update(primary_sdxl_size_and_crop_metadata_fields)
+            primary_output_conditioning_entries.append([raw_entry_tokens_tensor, primary_entry_metadata_dict])
+
+            upscaled_entry_metadata_dict = dict(raw_entry_metadata_dict_unstamped)
+            upscaled_entry_metadata_dict.update(upscaled_sdxl_size_and_crop_metadata_fields)
+            upscaled_output_conditioning_entries.append([raw_entry_tokens_tensor, upscaled_entry_metadata_dict])
 
         reference_full_prompt_text_for_output = "\n".join(per_group_full_prompt_text_for_reference_display)
-        return (output_conditioning_entries_combined_across_groups, reference_full_prompt_text_for_output)
+        return (
+            primary_output_conditioning_entries,
+            upscaled_output_conditioning_entries,
+            reference_full_prompt_text_for_output,
+        )
