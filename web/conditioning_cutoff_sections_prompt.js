@@ -21,6 +21,9 @@ import { app } from "../../scripts/app.js";
 const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "ConditioningCutoffSectionsPrompt";
 
 const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight)$/;
+const SECTION_TEXT_WIDGET_NAME_REGEX = /^section_(\d+)_text$/;
+const SECTION_HEADER_WIDGET_NAME_PREFIX = "__section_header_for_index_";
+const SECTION_HEADER_WIDGET_NAME_REGEX = /^__section_header_for_index_(\d+)$/;
 
 const HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX = "cutoffSectionsHidden:";
 
@@ -28,6 +31,55 @@ const HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX = "cutoffSectionsHidden:";
 // re-created on workflow load, so storing the originals on the widget would
 // not survive a configure pass.
 const original_widget_props_cache_by_widget_name = {};
+
+function ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(node) {
+  if (!node.widgets) return;
+  // Walk by index because we mutate node.widgets[]. Skip past header+text
+  // after inserting so we don't re-process them.
+  let widget_index_iterator_position = 0;
+  while (widget_index_iterator_position < node.widgets.length) {
+    const candidate_widget_at_current_position = node.widgets[widget_index_iterator_position];
+    const text_widget_name_regex_match = candidate_widget_at_current_position && candidate_widget_at_current_position.name
+      ? candidate_widget_at_current_position.name.match(SECTION_TEXT_WIDGET_NAME_REGEX)
+      : null;
+    if (!text_widget_name_regex_match) {
+      widget_index_iterator_position++;
+      continue;
+    }
+    const section_index_for_this_text_widget = parseInt(text_widget_name_regex_match[1], 10);
+    const expected_header_widget_name_for_this_section_index = SECTION_HEADER_WIDGET_NAME_PREFIX + section_index_for_this_text_widget;
+    const previous_widget_or_null = widget_index_iterator_position > 0
+      ? node.widgets[widget_index_iterator_position - 1]
+      : null;
+    if (previous_widget_or_null && previous_widget_or_null.name === expected_header_widget_name_for_this_section_index) {
+      // Header already in place.
+      widget_index_iterator_position++;
+      continue;
+    }
+    const new_section_header_widget_to_insert = {
+      name: expected_header_widget_name_for_this_section_index,
+      type: "custom",
+      value: "",
+      __section_index_for_header_display_only: section_index_for_this_text_widget,
+      options: { serialize: false },
+      draw(canvas_context, owning_node, widget_width_pixels, y_top_pixels, widget_height_pixels) {
+        canvas_context.save();
+        canvas_context.fillStyle = "#9aa";
+        canvas_context.font = "bold 11px Arial, sans-serif";
+        canvas_context.textBaseline = "middle";
+        const header_label_text = "── section " + this.__section_index_for_header_display_only + " ──";
+        canvas_context.fillText(header_label_text, 12, y_top_pixels + widget_height_pixels / 2);
+        canvas_context.restore();
+      },
+      computeSize(available_widget_width_pixels) {
+        return [available_widget_width_pixels, 16];
+      },
+    };
+    node.widgets.splice(widget_index_iterator_position, 0, new_section_header_widget_to_insert);
+    // Skip past the newly-inserted header AND the text widget that follows.
+    widget_index_iterator_position += 2;
+  }
+}
 
 function findWidgetByNameOnNodeOrUndefined(node, widget_name_to_find) {
   if (!node.widgets) return undefined;
@@ -126,9 +178,16 @@ function updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node) {
       continue;
     }
     const regex_match_for_section_widget_name = widget_descriptor.name.match(SECTION_WIDGET_NAME_REGEX);
-    if (!regex_match_for_section_widget_name) continue;
-    const this_widget_section_index = parseInt(regex_match_for_section_widget_name[1], 10);
-    const this_widget_should_be_visible = this_widget_section_index <= current_section_count_value;
+    const regex_match_for_section_header_widget_name = widget_descriptor.name.match(SECTION_HEADER_WIDGET_NAME_REGEX);
+    let this_widget_section_index_or_null = null;
+    if (regex_match_for_section_widget_name) {
+      this_widget_section_index_or_null = parseInt(regex_match_for_section_widget_name[1], 10);
+    } else if (regex_match_for_section_header_widget_name) {
+      this_widget_section_index_or_null = parseInt(regex_match_for_section_header_widget_name[1], 10);
+    } else {
+      continue;
+    }
+    const this_widget_should_be_visible = this_widget_section_index_or_null <= current_section_count_value;
     toggleVisibilityOfOneWidgetOnNodeMatchingComfyuiEasyUsePattern(
       node, widget_descriptor, this_widget_should_be_visible
     );
@@ -164,11 +223,13 @@ app.registerExtension({
         };
       }
 
+      ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(this);
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       // DOM elements may be inserted asynchronously after onNodeCreated.
       // A deferred second pass catches that case.
       const node_reference_for_deferred_update = this;
       setTimeout(function () {
+        ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(node_reference_for_deferred_update);
         updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node_reference_for_deferred_update);
       }, 0);
       return original_on_node_created_return_value;
@@ -188,6 +249,7 @@ app.registerExtension({
           delete original_widget_props_cache_by_widget_name[widget_descriptor.name];
         }
       }
+      ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(this);
       updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(this);
       return original_on_configure_return_value;
     };
