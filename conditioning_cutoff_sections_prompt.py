@@ -26,7 +26,12 @@ clear runtime error pointing at the install URL.
 """
 
 import inspect
+import logging
+import re
 import sys
+
+
+WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT = re.compile(r"\s+")
 
 
 MAX_SECTION_COUNT_SUPPORTED = 16
@@ -88,11 +93,19 @@ def _collect_active_non_empty_sections_from_kwargs(kwargs_dict, active_section_c
         section_text_raw = kwargs_dict.get(f"section_{section_index}_text", "")
         section_isolate_raw = kwargs_dict.get(f"section_{section_index}_isolate", True)
         section_weight_raw = kwargs_dict.get(f"section_{section_index}_weight", 1.0)
-        section_text_stripped = (section_text_raw or "").strip()
-        if not section_text_stripped:
+        # Collapse any whitespace run (multiple spaces, tabs, newlines) into
+        # a single space, then strip. This avoids Cutoff's
+        # target_text.split(" ") producing empty strings (e.g. "warm  light"
+        # split on space gives ["warm", "", "light"]), which would tokenize
+        # to an empty list and trip an IndexError inside Cutoff's
+        # get_sublists at sub_list[0].
+        section_text_normalized_whitespace = WHITESPACE_RUN_REGEX_FOR_NORMALIZING_SECTION_TEXT.sub(
+            " ", (section_text_raw or "")
+        ).strip()
+        if not section_text_normalized_whitespace:
             continue
         active_section_descriptors_list.append({
-            "text": section_text_stripped,
+            "text": section_text_normalized_whitespace,
             "isolate": bool(section_isolate_raw),
             "weight": float(section_weight_raw),
         })
@@ -119,13 +132,22 @@ def _build_populated_cutoff_clip_regions_state_with_isolated_sections_registered
         # region_text == target_text == section text gives "phrase-level
         # decontamination" — confines that whole phrase's influence to its
         # own token region.
-        next_state_tuple = add_region_node_instance.add_clip_region(
-            current_clip_regions_state,
-            section_descriptor["text"],
-            section_descriptor["text"],
-            section_descriptor["weight"],
-        )
-        current_clip_regions_state = next_state_tuple[0]
+        try:
+            next_state_tuple = add_region_node_instance.add_clip_region(
+                current_clip_regions_state,
+                section_descriptor["text"],
+                section_descriptor["text"],
+                section_descriptor["weight"],
+            )
+            current_clip_regions_state = next_state_tuple[0]
+        except Exception as cutoff_register_region_exception:
+            logging.warning(
+                "ConditioningCutoffSectionsPrompt: skipped isolate registration "
+                f"for section text {section_descriptor['text']!r} "
+                f"(Cutoff raised {type(cutoff_register_region_exception).__name__}: "
+                f"{cutoff_register_region_exception}). Section is still in the "
+                "full prompt but not isolated."
+            )
     return current_clip_regions_state
 
 
