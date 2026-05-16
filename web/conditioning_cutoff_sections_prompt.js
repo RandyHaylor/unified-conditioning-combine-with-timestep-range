@@ -98,11 +98,16 @@ function updateAllSectionWidgetVisibilityBasedOnCurrentSectionCountValue(node) {
     const this_widget_section_index = parseInt(regex_match_for_section_widget_name[1], 10);
     setVisibilityOfOneWidget(widget_descriptor, this_widget_section_index > current_section_count_value);
   }
-  // Resize the node to fit the new widget layout.
-  if (typeof node.computeSize === "function") {
-    const min_size_for_visible_widgets = node.computeSize();
-    // Preserve current width; bump height to new minimum.
-    node.size[1] = min_size_for_visible_widgets[1];
+  // Resize the node to fit the new widget layout. Use the canonical
+  // setSize([max_width, new_height]) pattern (matches comfy-mtb's
+  // convertToWidget at comfy_shared.js:171) so LiteGraph re-lays-out
+  // widgets correctly — direct mutation of node.size[1] doesn't
+  // trigger the relayout that newly-visible widgets need.
+  if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
+    const min_size_for_currently_visible_widgets = node.computeSize();
+    const new_width_preserving_user_drag = Math.max(node.size[0], min_size_for_currently_visible_widgets[0]);
+    const new_height_to_fit_visible_widgets = min_size_for_currently_visible_widgets[1];
+    node.setSize([new_width_preserving_user_drag, new_height_to_fit_visible_widgets]);
   }
   node.setDirtyCanvas(true, true);
 }
