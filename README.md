@@ -389,6 +389,10 @@ raises a clear runtime error pointing you to the install link.
   `region_text == target_text == section text` (phrase-level
   decontamination). If false, the section is still included in the
   full prompt but not isolated.
+- `section_N_weight` (FLOAT -10..10, default `1.0`) — passed to Cutoff's
+  `add_clip_region` as the region weight. Only effective when
+  `section_N_isolate` is true. Range and default match stock
+  `CLIPSetRegion`.
 
 Outputs:
 - `conditioning` (CONDITIONING) — finalized through Cutoff; wire to a sampler.

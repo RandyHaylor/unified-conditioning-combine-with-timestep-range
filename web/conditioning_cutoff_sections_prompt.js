@@ -15,7 +15,7 @@ import { app } from "../../scripts/app.js";
 
 const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "ConditioningCutoffSectionsPrompt";
 
-const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate)$/;
+const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(text|isolate|weight)$/;
 
 const HIDDEN_WIDGET_COMPUTE_SIZE_RETURN_HEIGHT = -4;
 

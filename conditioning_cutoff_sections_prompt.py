@@ -56,12 +56,14 @@ def _collect_active_non_empty_sections_from_kwargs(kwargs_dict, active_section_c
     for section_index in range(1, int(active_section_count) + 1):
         section_text_raw = kwargs_dict.get(f"section_{section_index}_text", "")
         section_isolate_raw = kwargs_dict.get(f"section_{section_index}_isolate", True)
+        section_weight_raw = kwargs_dict.get(f"section_{section_index}_weight", 1.0)
         section_text_stripped = (section_text_raw or "").strip()
         if not section_text_stripped:
             continue
         active_section_descriptors_list.append({
             "text": section_text_stripped,
             "isolate": bool(section_isolate_raw),
+            "weight": float(section_weight_raw),
         })
     return active_section_descriptors_list
 
@@ -90,7 +92,7 @@ def _build_populated_cutoff_clip_regions_state_with_isolated_sections_registered
             current_clip_regions_state,
             section_descriptor["text"],
             section_descriptor["text"],
-            1.0,
+            section_descriptor["weight"],
         )
         current_clip_regions_state = next_state_tuple[0]
     return current_clip_regions_state
@@ -118,6 +120,9 @@ class ConditioningCutoffSectionsPrompt:
             )
             required_inputs_dict[f"section_{section_index_for_declaration}_isolate"] = (
                 "BOOLEAN", {"default": True},
+            )
+            required_inputs_dict[f"section_{section_index_for_declaration}_weight"] = (
+                "FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05},
             )
         return {"required": required_inputs_dict}
 
