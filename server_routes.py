@@ -43,6 +43,21 @@ from .embedding_index_scanner import (
 EXPLICIT_EMBEDDING_REFERENCE_REGEX_PATTERN = re.compile(r"embedding:([\w./\\-]+)")
 
 
+def _strip_folder_path_prefix_from_embedding_name_returning_just_basename(name_with_possible_folder_path):
+    """
+    Returns just the basename of an embedding name that may include a
+    relative folder path. Handles both `/` and `\\` as separators so
+    Windows-style references (e.g. `style\\lazyhand`) and posix-style
+    (e.g. `style/lazyhand`) both collapse to `lazyhand` for display.
+    """
+    last_forward_slash_position = name_with_possible_folder_path.rfind("/")
+    last_back_slash_position = name_with_possible_folder_path.rfind("\\")
+    last_separator_position = max(last_forward_slash_position, last_back_slash_position)
+    if last_separator_position >= 0:
+        return name_with_possible_folder_path[last_separator_position + 1:]
+    return name_with_possible_folder_path
+
+
 def _collect_all_embedding_references_appearing_in_one_prompt_text(
     one_prompt_text, embedding_lowercase_stem_to_index_entry_map
 ):
@@ -127,9 +142,12 @@ async def validate_prompt_embeddings_sdxl_http_route_handler(request):
         lowercase_stem_for_lookup,
         _bare_tag_flag,
     ) in sorted_references_for_stable_output:
+        name_for_display_without_any_folder_path_prefix = (
+            _strip_folder_path_prefix_from_embedding_name_returning_just_basename(name_used_in_prompt)
+        )
         if lowercase_stem_for_lookup not in embedding_index_map:
             output_classification_message_lines.append(
-                f"embedding:{name_used_in_prompt} not found on system"
+                f"embedding:{name_for_display_without_any_folder_path_prefix} not found on system"
             )
             continue
         index_entry_for_this_embedding = embedding_index_map[lowercase_stem_for_lookup]
@@ -137,7 +155,7 @@ async def validate_prompt_embeddings_sdxl_http_route_handler(request):
             index_entry_for_this_embedding["tensor_last_dim_set"]
         ):
             output_classification_message_lines.append(
-                f"embedding:{name_used_in_prompt} incompatible with SDXL"
+                f"embedding:{name_for_display_without_any_folder_path_prefix} incompatible with SDXL"
             )
 
     return web.json_response({"messages": output_classification_message_lines})
