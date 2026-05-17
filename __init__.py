@@ -31,7 +31,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DebugConditioning": "Debug Conditioning",
     "CLIPTextEncodeSDXLAutoSplitAndMerge": "CLIPTextEncodeSDXL (auto-split-and-merge)",
     "ConditioningCropZoomSDXL": "Conditioning-crop-zoom-SDXL",
-    "CLIPTextEncodeWithCutoffRegionSeparation": "CLIP Text Encode (Cutoff Region Separation)",
+    "CLIPTextEncodeWithCutoffRegionSeparation": "CLIP Text Encode SDXL (Cutoff Region Enhanced)",
 }
 
 WEB_DIRECTORY = "./web"
