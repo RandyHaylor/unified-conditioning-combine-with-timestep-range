@@ -57,8 +57,10 @@ import logging
 import re
 
 from .clip_text_encode_sdxl_v3_global_and_enhanced import (
+    apply_v3_per_text_transforms_to_one_text_string,
     encode_active_v3_sections_into_one_sdxl_conditioning_entry,
     build_per_stream_base_prompt_text_and_per_section_base_fragment_list,
+    build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display,
     compute_sdxl_size_and_crop_metadata_fields,
     resolve_target_image_width_and_height_from_optional_latent_or_defaults,
     clamp_numeric_value_inclusive,
@@ -259,6 +261,15 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
                     "min": UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
                     "step": 0.01,
                 }),
+                "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
+                "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
+                "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "List can be modified in custom node folder: "
+                        "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
+                    ),
+                }),
                 "zoom": ("FLOAT", {
                     "default": ZOOM_DEFAULT_VALUE,
                     "min": ZOOM_MINIMUM_VALUE,
@@ -293,6 +304,9 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         clip,
         inline_tagged_prompt_text,
         upscaled_conditioning_multiplier,
+        support_a1111_style_embedding_text,
+        remove_text_for_unsupported_embeddings,
+        filter_known_a1111_embedding_tags_not_installed_locally,
         zoom,
         offset_x,
         offset_y,
@@ -303,6 +317,35 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
                 str(inline_tagged_prompt_text or "")
             )
         )
+
+        # Apply v3-style per-section text transforms (A1111 rewrite,
+        # unsupported-embedding strip, orphan-tag filter, shape-mismatch
+        # warning logging) to BOTH global_text and enhanced_text of every
+        # parsed section. Mutates in place.
+        for section_descriptor_to_transform_text_of in parsed_section_descriptors_list:
+            section_descriptor_to_transform_text_of["global_text"] = (
+                apply_v3_per_text_transforms_to_one_text_string(
+                    section_descriptor_to_transform_text_of.get("global_text", ""),
+                    clip,
+                    bool(support_a1111_style_embedding_text),
+                    bool(remove_text_for_unsupported_embeddings),
+                    bool(filter_known_a1111_embedding_tags_not_installed_locally),
+                )
+            )
+            section_descriptor_to_transform_text_of["enhanced_text"] = (
+                apply_v3_per_text_transforms_to_one_text_string(
+                    section_descriptor_to_transform_text_of.get("enhanced_text", ""),
+                    clip,
+                    bool(support_a1111_style_embedding_text),
+                    bool(remove_text_for_unsupported_embeddings),
+                    bool(filter_known_a1111_embedding_tags_not_installed_locally),
+                )
+            )
+        # Drop sections that ended up fully empty after transforms.
+        parsed_section_descriptors_list = [
+            section_descriptor for section_descriptor in parsed_section_descriptors_list
+            if section_descriptor.get("global_text") or section_descriptor.get("enhanced_text")
+        ]
 
         # SDXL geometry resolution (primary + upscaled).
         primary_target_image_width, primary_target_image_height = (
@@ -379,14 +422,14 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         upscaled_entry_metadata_dict = dict(raw_metadata_dict)
         upscaled_entry_metadata_dict.update(upscaled_sdxl_size_and_crop_metadata_fields)
 
-        reference_base_prompt_text_for_g_stream, _ = (
-            build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
-                parsed_section_descriptors_list, "g"
+        reference_plain_text_for_user_display = (
+            build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
+                parsed_section_descriptors_list
             )
         )
 
         return (
             [[raw_tokens_tensor, primary_entry_metadata_dict]],
             [[raw_tokens_tensor, upscaled_entry_metadata_dict]],
-            reference_base_prompt_text_for_g_stream,
+            reference_plain_text_for_user_display,
         )

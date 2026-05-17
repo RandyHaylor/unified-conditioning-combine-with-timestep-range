@@ -23,13 +23,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 
-// Set of node type names this validator widget attaches to. Both v1 and v3
-// use the same `section_N_*_text` widget naming convention (v1 has just
-// `_text`; v3 has `_global_text` and `_enhanced_text`) and both want the
-// realtime embedding-issue validator widget at the bottom of the node.
+// Set of node type names this validator widget attaches to.
+// v1: section_N_text
+// v3: section_N_global_text / section_N_enhanced_text
+// inline-tagged: inline_tagged_prompt_text (single field, no section prefix)
 const NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS = new Set([
   "CLIPTextEncodeWithCutoffRegionSeparation",
   "CLIPTextEncodeSDXLV3GlobalAndEnhanced",
+  "CLIPTextEncodeSDXLEnhancedInlineTagged",
 ]);
 const NODE_TYPE_NAME_THIS_EXTENSION_TARGETS = "CLIPTextEncodeWithCutoffRegionSeparation";
 const VALIDATION_STATUS_READ_ONLY_WIDGET_NAME = "validation_status";
@@ -56,12 +57,16 @@ function debounce_function_invocation_until_no_call_for_this_many_ms(
 }
 
 function widget_is_one_of_the_per_section_prompt_text_widgets(widget_object) {
-  return (
-    widget_object
-    && widget_object.name
-    && widget_object.name.startsWith("section_")
-    && widget_object.name.endsWith("_text")
-  );
+  if (!widget_object || !widget_object.name) return false;
+  // v1: section_N_text. v3: section_N_global_text / section_N_enhanced_text.
+  if (widget_object.name.startsWith("section_") && widget_object.name.endsWith("_text")) {
+    return true;
+  }
+  // inline-tagged: single field named inline_tagged_prompt_text.
+  if (widget_object.name === "inline_tagged_prompt_text") {
+    return true;
+  }
+  return false;
 }
 
 function gather_current_text_values_from_all_section_text_widgets_on_node(node) {

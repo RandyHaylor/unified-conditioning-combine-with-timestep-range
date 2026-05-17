@@ -724,6 +724,44 @@ def _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
     )
 
 
+def _build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
+    active_section_descriptors_list,
+):
+    """
+    Stream-independent display-only reference string. Walks active
+    sections in declaration order and emits each section's natural text
+    (enhanced_text if it's a true region, else global_text) WITHOUT
+    any `(text:weight)` CLIP attention-weight wrapping. This is what
+    the user sees when they connect `reference_full_prompt` to a
+    ShowText node.
+
+    Excludes sections whose BOTH per-stream strengths are zero (they
+    contribute to neither stream so they're effectively excluded from
+    the encoding entirely).
+    """
+    plain_text_parts_in_declaration_order = []
+    for section_descriptor in active_section_descriptors_list:
+        per_section_l_strength = float(section_descriptor.get("clip_l_strength", 1.0))
+        per_section_g_strength = float(section_descriptor.get("clip_g_strength", 1.0))
+        if per_section_l_strength == 0 and per_section_g_strength == 0:
+            continue
+        if section_descriptor.get("is_true_region"):
+            plain_text_for_this_section = (
+                section_descriptor.get("enhanced_text")
+                or section_descriptor.get("global_text")
+                or ""
+            )
+        else:
+            plain_text_for_this_section = (
+                section_descriptor.get("global_text")
+                or section_descriptor.get("enhanced_text")
+                or ""
+            )
+        if plain_text_for_this_section.strip():
+            plain_text_parts_in_declaration_order.append(plain_text_for_this_section.strip())
+    return ", ".join(plain_text_parts_in_declaration_order)
+
+
 def _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
     section_descriptor,
 ):
@@ -1377,16 +1415,16 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
         # else global_text). Both streams produce the same base text since
         # weights only affect the (text:weight) wrapping; show the G-stream
         # build for canonical display.
-        reference_base_prompt_text_for_g_stream, _ = (
-            _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
-                active_section_descriptors_list, "g"
+        reference_plain_text_for_user_display = (
+            _build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
+                active_section_descriptors_list
             )
         )
 
         return (
             [[raw_tokens_tensor, primary_entry_metadata_dict]],
             [[raw_tokens_tensor, upscaled_entry_metadata_dict]],
-            reference_base_prompt_text_for_g_stream,
+            reference_plain_text_for_user_display,
         )
 
 
@@ -1405,6 +1443,7 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
 apply_v3_per_text_transforms_to_one_text_string = _apply_v3_per_text_transforms_to_one_text_string
 encode_active_v3_sections_into_one_sdxl_conditioning_entry = _encode_active_v3_sections_into_one_sdxl_conditioning_entry
 build_per_stream_base_prompt_text_and_per_section_base_fragment_list = _build_per_stream_base_prompt_text_and_per_section_base_fragment_list
+build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display = _build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display
 compute_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields
 resolve_target_image_width_and_height_from_optional_latent_or_defaults = _resolve_target_image_width_and_height_from_optional_latent_or_defaults
 clamp_numeric_value_inclusive = _clamp_numeric_value_inclusive

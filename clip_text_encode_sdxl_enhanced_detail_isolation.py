@@ -32,6 +32,7 @@ from .clip_text_encode_sdxl_v3_global_and_enhanced import (
     apply_v3_per_text_transforms_to_one_text_string,
     encode_active_v3_sections_into_one_sdxl_conditioning_entry,
     build_per_stream_base_prompt_text_and_per_section_base_fragment_list,
+    build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display,
     compute_sdxl_size_and_crop_metadata_fields,
     resolve_target_image_width_and_height_from_optional_latent_or_defaults,
     clamp_numeric_value_inclusive,
@@ -248,14 +249,14 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolation:
         upscaled_entry_metadata_dict = dict(raw_metadata_dict)
         upscaled_entry_metadata_dict.update(upscaled_sdxl_size_and_crop_metadata_fields)
 
-        reference_base_prompt_text_for_g_stream, _ = (
-            build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
-                section_descriptors_from_chain_list, "g"
+        reference_plain_text_for_user_display = (
+            build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
+                section_descriptors_from_chain_list
             )
         )
 
         return (
             [[raw_tokens_tensor, primary_entry_metadata_dict]],
             [[raw_tokens_tensor, upscaled_entry_metadata_dict]],
-            reference_base_prompt_text_for_g_stream,
+            reference_plain_text_for_user_display,
         )
