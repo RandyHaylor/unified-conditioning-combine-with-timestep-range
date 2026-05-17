@@ -378,8 +378,30 @@ def _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set():
     return _cached_lowercase_set_of_known_a1111_embedding_names_to_filter
 
 
+def _parse_custom_embedding_names_string_into_lowercase_set(custom_names_input_text_string):
+    """
+    User-facing widget value: lines and/or comma-separated names. Returns
+    a lowercase set suitable for merging with the file-based list. Lines
+    starting with `#` are treated as comments.
+    """
+    parsed_lowercase_names_set = set()
+    if not custom_names_input_text_string:
+        return parsed_lowercase_names_set
+    for one_raw_line in custom_names_input_text_string.splitlines():
+        stripped_line_text = one_raw_line.strip()
+        if not stripped_line_text or stripped_line_text.startswith("#"):
+            continue
+        for one_comma_separated_name in stripped_line_text.split(","):
+            stripped_name = one_comma_separated_name.strip()
+            if stripped_name:
+                parsed_lowercase_names_set.add(stripped_name.lower())
+    return parsed_lowercase_names_set
+
+
 def _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
-    prompt_text_string, available_embedding_lowercase_stem_to_filenames_map
+    prompt_text_string,
+    available_embedding_lowercase_stem_to_filenames_map,
+    additional_custom_names_lowercase_set=None,
 ):
     """
     Walks comma-separated tags. For each bare tag (not already
@@ -391,8 +413,16 @@ def _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_lo
     if not prompt_text_string:
         return prompt_text_string
 
-    known_a1111_embedding_names_lowercase_set = (
+    known_a1111_embedding_names_lowercase_set_from_file = (
         _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set()
+    )
+    custom_additional_names_lowercase_set = (
+        additional_custom_names_lowercase_set
+        if additional_custom_names_lowercase_set is not None
+        else set()
+    )
+    known_a1111_embedding_names_lowercase_set = (
+        known_a1111_embedding_names_lowercase_set_from_file | custom_additional_names_lowercase_set
     )
     if not known_a1111_embedding_names_lowercase_set:
         return prompt_text_string
@@ -737,6 +767,7 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     support_a1111_style_embedding_text_setting=True,
     remove_text_for_unsupported_embeddings_setting=True,
     filter_known_a1111_embedding_tags_not_installed_locally_setting=True,
+    custom_embedding_names_to_strip_setting="",
 ):
     """
     Returns a single CONDITIONING entry [combined_tokens_tensor, metadata_dict]
@@ -759,10 +790,16 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
         available_embedding_lowercase_stem_to_filenames_map = (
             _build_lookup_of_available_embedding_stems_to_their_filename_list()
         )
+        additional_custom_lowercase_names_set_from_node_widget = (
+            _parse_custom_embedding_names_string_into_lowercase_set(
+                custom_embedding_names_to_strip_setting
+            )
+        )
         group_full_prompt_text_for_isolate_streams = (
             _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
                 group_full_prompt_text_for_isolate_streams,
                 available_embedding_lowercase_stem_to_filenames_map,
+                additional_custom_names_lowercase_set=additional_custom_lowercase_names_set_from_node_widget,
             )
         )
     # A1111-style sweep: identify bare tags that exactly match an embedding
@@ -941,6 +978,11 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
             "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
             "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
             "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {"default": True}),
+            "custom_embedding_names_to_strip": ("STRING", {
+                "multiline": True,
+                "default": "",
+                "placeholder": "One name per line (or comma-separated). Added to the file-based known-names filter.",
+            }),
         }
         for section_index_for_declaration in range(1, MAX_SECTION_COUNT_SUPPORTED + 1):
             required_inputs_dict[f"section_{section_index_for_declaration}_text"] = (
@@ -983,6 +1025,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         support_a1111_style_embedding_text=True,
         remove_text_for_unsupported_embeddings=True,
         filter_known_a1111_embedding_tags_not_installed_locally=True,
+        custom_embedding_names_to_strip="",
         latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
@@ -1054,6 +1097,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                     support_a1111_style_embedding_text_setting=bool(support_a1111_style_embedding_text),
                     remove_text_for_unsupported_embeddings_setting=bool(remove_text_for_unsupported_embeddings),
                     filter_known_a1111_embedding_tags_not_installed_locally_setting=bool(filter_known_a1111_embedding_tags_not_installed_locally),
+                    custom_embedding_names_to_strip_setting=str(custom_embedding_names_to_strip or ""),
                 )
                 raw_conditioning_entries_collected_across_all_groups.append(empty_conditioning_entry)
             except Exception as encoding_failure_for_empty_prompt:

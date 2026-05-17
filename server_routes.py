@@ -106,7 +106,34 @@ async def validate_prompt_embeddings_sdxl_http_route_handler(request):
             status=400,
         )
 
+    # Optional fields from the frontend that mirror the runtime node toggles.
+    custom_embedding_names_to_strip_text_from_widget = str(
+        request_body_json_payload.get("custom_embedding_names_to_strip", "")
+    )
+    filter_known_a1111_embedding_tags_not_installed_locally_setting_from_widget = bool(
+        request_body_json_payload.get("filter_known_a1111_embedding_tags_not_installed_locally", True)
+    )
+
     embedding_index_map = get_cached_or_build_embedding_lowercase_stem_to_index_entry_map()
+
+    # Build the union of "known A1111 embedding names" (file-based curated list
+    # + per-node custom widget) to report orphan-tag-strip actions when the
+    # corresponding toggle is on at the node.
+    union_of_known_a1111_embedding_names_lowercase_set = set()
+    if filter_known_a1111_embedding_tags_not_installed_locally_setting_from_widget:
+        try:
+            from .clip_text_encode_with_cutoff_region_separation import (
+                _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set,
+                _parse_custom_embedding_names_string_into_lowercase_set,
+            )
+            union_of_known_a1111_embedding_names_lowercase_set = (
+                _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set()
+                | _parse_custom_embedding_names_string_into_lowercase_set(
+                    custom_embedding_names_to_strip_text_from_widget
+                )
+            )
+        except Exception:
+            pass
 
     all_embedding_references_combined_across_every_prompt_text = set()
     for one_prompt_text_string in prompt_texts_list:
@@ -125,19 +152,33 @@ async def validate_prompt_embeddings_sdxl_http_route_handler(request):
     for (
         name_used_in_prompt,
         lowercase_stem_for_lookup,
-        _bare_tag_flag,
+        is_a1111_bare_style_reference,
     ) in sorted_references_for_stable_output:
         if lowercase_stem_for_lookup not in embedding_index_map:
-            output_classification_message_lines.append(
-                f"embedding:{name_used_in_prompt} not found on system"
-            )
+            # File doesn't exist locally. If this is a bare tag matching the
+            # known-A1111-embedding-names filter list, the runtime will strip
+            # it. Otherwise it would fall through to the runtime's
+            # `remove_text_for_unsupported_embeddings` path or stock encoder
+            # warning. Either way: the embedding will not contribute.
+            if (
+                is_a1111_bare_style_reference
+                and lowercase_stem_for_lookup in union_of_known_a1111_embedding_names_lowercase_set
+            ):
+                output_classification_message_lines.append(
+                    f"Embedding {name_used_in_prompt} not installed locally, "
+                    f"will be stripped (orphan A1111 tag filter)"
+                )
+            else:
+                output_classification_message_lines.append(
+                    f"Embedding {name_used_in_prompt} not found in system, will be ignored"
+                )
             continue
         index_entry_for_this_embedding = embedding_index_map[lowercase_stem_for_lookup]
         if not is_embedding_file_fully_compatible_with_sdxl_based_on_its_tensor_last_dim_set(
             index_entry_for_this_embedding["tensor_last_dim_set"]
         ):
             output_classification_message_lines.append(
-                f"embedding:{name_used_in_prompt} incompatible with SDXL"
+                f"Embedding {name_used_in_prompt} incompatible with SDXL, will be ignored"
             )
 
     return web.json_response({"messages": output_classification_message_lines})

@@ -66,6 +66,16 @@ function gather_current_text_values_from_all_section_text_widgets_on_node(node) 
   return collected_text_values_in_widget_array_order;
 }
 
+function read_one_widget_value_by_name_or_default(node, widget_name_to_find, fallback_value) {
+  const matching_widget_or_undefined = (node.widgets || []).find(
+    function find_named_widget(w) {
+      return w && w.name === widget_name_to_find;
+    }
+  );
+  if (!matching_widget_or_undefined) return fallback_value;
+  return matching_widget_or_undefined.value;
+}
+
 function write_lines_into_validation_status_widget_and_redraw_node(node, message_lines_list) {
   const validation_widget_or_undefined = (node.widgets || []).find(
     function find_status_widget(w) {
@@ -85,11 +95,21 @@ function write_lines_into_validation_status_widget_and_redraw_node(node, message
 
 async function fetch_validation_results_from_server_and_update_widget_for_node(node) {
   const all_section_text_values = gather_current_text_values_from_all_section_text_widgets_on_node(node);
+  const custom_embedding_names_to_strip_widget_value = String(
+    read_one_widget_value_by_name_or_default(node, "custom_embedding_names_to_strip", "") || ""
+  );
+  const filter_known_a1111_widget_value = Boolean(
+    read_one_widget_value_by_name_or_default(node, "filter_known_a1111_embedding_tags_not_installed_locally", true)
+  );
   try {
     const http_response = await api.fetchApi(PROMPT_VALIDATION_HTTP_ENDPOINT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt_texts: all_section_text_values }),
+      body: JSON.stringify({
+        prompt_texts: all_section_text_values,
+        custom_embedding_names_to_strip: custom_embedding_names_to_strip_widget_value,
+        filter_known_a1111_embedding_tags_not_installed_locally: filter_known_a1111_widget_value,
+      }),
     });
     const parsed_response_body = await http_response.json();
     const message_lines = Array.isArray(parsed_response_body && parsed_response_body.messages)
@@ -169,6 +189,29 @@ app.registerExtension({
         attach_realtime_input_listener_to_one_text_widget_if_not_already_attached(
           one_widget_on_node, node, debounced_validation_runner_for_this_node
         );
+      }
+      // Also fire validation when the user edits the custom-names text input
+      // or toggles filter_known_a1111_embedding_tags_not_installed_locally so
+      // the displayed warnings stay in sync with the runtime behavior.
+      if (
+        one_widget_on_node
+        && one_widget_on_node.name === "custom_embedding_names_to_strip"
+      ) {
+        attach_realtime_input_listener_to_one_text_widget_if_not_already_attached(
+          one_widget_on_node, node, debounced_validation_runner_for_this_node
+        );
+      }
+      if (
+        one_widget_on_node
+        && one_widget_on_node.name === "filter_known_a1111_embedding_tags_not_installed_locally"
+      ) {
+        const original_widget_callback_function = one_widget_on_node.callback;
+        one_widget_on_node.callback = function on_filter_toggle_change() {
+          if (original_widget_callback_function) {
+            original_widget_callback_function.apply(this, arguments);
+          }
+          debounced_validation_runner_for_this_node(node);
+        };
       }
     }
 
