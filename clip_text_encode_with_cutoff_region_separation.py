@@ -329,6 +329,51 @@ def _pad_per_stream_tokenization_to_match_chunk_count(
     return embedding_tensor_for_short_stream
 
 
+def _encode_one_group_via_plain_stock_clip_without_any_isolation(
+    clip_object,
+    section_descriptors_in_group_list,
+    clip_pass_choice_for_this_group,
+    join_separator_string,
+):
+    """
+    Stock-style fallback used when the cutoff isolation path fails (e.g.,
+    prompt contains an embedding with shape that doesn't match the target
+    CLIP stream's embedding dim). Returns a CONDITIONING list (typically
+    one entry).
+
+    For Pass L+G: same text fed to both streams.
+    For Pass L only: text fed to L; G is the empty prompt.
+    For Pass G only: symmetric.
+    For Classic (which has its own encoder path): also handled as L+G here
+    since we can't reproduce the classic plugin's behavior in fallback.
+    """
+    group_full_prompt_text = _build_full_prompt_text_for_one_group_of_sections(
+        section_descriptors_in_group_list, join_separator_string
+    )
+
+    if clip_pass_choice_for_this_group == CLIP_STREAM_PASS_L_ONLY:
+        text_for_l_stream = group_full_prompt_text
+        text_for_g_stream = ""
+    elif clip_pass_choice_for_this_group == CLIP_STREAM_PASS_G_ONLY:
+        text_for_l_stream = ""
+        text_for_g_stream = group_full_prompt_text
+    else:
+        text_for_l_stream = group_full_prompt_text
+        text_for_g_stream = group_full_prompt_text
+
+    tokens_for_stock_fallback_encode = clip_object.tokenize(text_for_g_stream)
+    tokens_for_stock_fallback_encode["l"] = clip_object.tokenize(text_for_l_stream)["l"]
+
+    # Match stock CLIPTextEncodeSDXL's pad-shorter-side-with-empty logic.
+    empty_tokens_dict_for_padding = clip_object.tokenize("")
+    while len(tokens_for_stock_fallback_encode["l"]) < len(tokens_for_stock_fallback_encode["g"]):
+        tokens_for_stock_fallback_encode["l"] += empty_tokens_dict_for_padding["l"]
+    while len(tokens_for_stock_fallback_encode["l"]) > len(tokens_for_stock_fallback_encode["g"]):
+        tokens_for_stock_fallback_encode["g"] += empty_tokens_dict_for_padding["g"]
+
+    return clip_object.encode_from_tokens_scheduled(tokens_for_stock_fallback_encode)
+
+
 def _encode_one_group_into_one_sdxl_conditioning_entry(
     clip_object,
     section_descriptors_in_group_list,
@@ -639,10 +684,34 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                         raw_conditioning_entries_collected_across_all_groups.append(group_conditioning_entry)
                 except Exception as group_encoding_failure:
                     logging.warning(
-                        f"CLIPTextEncodeWithCutoffRegionSeparation: group '{clip_pass_choice_for_this_group}' "
-                        f"encoding failed: {type(group_encoding_failure).__name__}: {group_encoding_failure}. "
-                        f"Skipping this group."
+                        f"CLIPTextEncodeWithCutoffRegionSeparation: group "
+                        f"'{clip_pass_choice_for_this_group}' cutoff-style encoding failed "
+                        f"({type(group_encoding_failure).__name__}: {group_encoding_failure}). "
+                        f"Falling back to plain stock-style encoding for this group (cutoff "
+                        f"isolation will not be applied for it)."
                     )
+                    try:
+                        stock_fallback_conditioning_entry_list = _encode_one_group_via_plain_stock_clip_without_any_isolation(
+                            clip,
+                            section_descriptors_in_this_group,
+                            clip_pass_choice_for_this_group,
+                            join_separator,
+                        )
+                        for stock_fallback_entry in stock_fallback_conditioning_entry_list:
+                            raw_conditioning_entries_collected_across_all_groups.append(stock_fallback_entry)
+                        full_prompt_text_for_this_group_display = _build_full_prompt_text_for_one_group_of_sections(
+                            section_descriptors_in_this_group, join_separator
+                        )
+                        per_group_full_prompt_text_for_reference_display.append(
+                            f"[{clip_pass_choice_for_this_group}] (stock fallback) {full_prompt_text_for_this_group_display}"
+                        )
+                    except Exception as stock_fallback_failure:
+                        logging.warning(
+                            f"CLIPTextEncodeWithCutoffRegionSeparation: stock-style fallback "
+                            f"for group '{clip_pass_choice_for_this_group}' also failed "
+                            f"({type(stock_fallback_failure).__name__}: {stock_fallback_failure}). "
+                            f"Skipping this group entirely."
+                        )
                     continue
 
                 full_prompt_text_for_this_group_display = _build_full_prompt_text_for_one_group_of_sections(
