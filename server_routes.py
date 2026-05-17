@@ -187,4 +187,125 @@ async def rescan_embeddings_directory_http_route_handler(_request):
     return web.json_response({"indexed_file_count": len(rebuilt_index_map)})
 
 
-logging.info("unified-conditioning-merge: registered HTTP routes for realtime embedding validation.")
+# ──────────────────────────────────────────────────────────────────────
+# v3-specific: target-words-in-enhanced-text check.
+#
+# Standalone from the embedding validator above. The v3 frontend extension
+# posts per-section (global_text, enhanced_text) pairs to this endpoint
+# whenever the user edits a section. For each section where enhanced_text
+# is non-empty AND differs from global_text, this endpoint checks whether
+# each space-split word of global_text appears as a whole-word substring
+# of enhanced_text. Words not found yield a warning.
+#
+# Word-boundary substring match (not CLIP-token-level): the v3 runtime
+# encoder does the authoritative token-level match when actually building
+# masks. This endpoint exists purely to surface a UI hint to the user
+# while they're editing, so the simpler word-boundary check is sufficient
+# and avoids needing a CLIP tokenizer here.
+# ──────────────────────────────────────────────────────────────────────
+
+V3_TARGET_WORDS_NOT_FOUND_IN_ENHANCED_WARNING_HTTP_ENDPOINT_PATH = (
+    "/unified-conditioning-merge/v3_check_target_words_present_in_enhanced_text"
+)
+
+
+def _build_per_word_boundary_regex_pattern_for_one_target_word(target_word_string):
+    """
+    Returns a compiled regex that matches the target word as a whole word
+    (no preceding/following word character). Used to verify the target
+    appears inside the enhanced_text. Case-insensitive.
+    """
+    return re.compile(
+        r"(?<!\w)" + re.escape(target_word_string) + r"(?!\w)",
+        re.IGNORECASE,
+    )
+
+
+def _identify_missing_target_words_for_one_v3_section_global_in_enhanced(
+    section_one_based_index, raw_global_text, raw_enhanced_text
+):
+    """
+    Returns a list of warning strings for this section. Empty list if
+    nothing to warn about.
+
+    Rules:
+      - If enhanced_text is empty OR equals global_text (case-insensitive,
+        whitespace-normalized) → this section is a passthrough, no check.
+      - Otherwise, split global_text on whitespace. For each word, verify
+        it appears as a whole-word match (case-insensitive) inside
+        enhanced_text. If not, emit a warning.
+    """
+    normalized_global_text_value = (raw_global_text or "").strip()
+    normalized_enhanced_text_value = (raw_enhanced_text or "").strip()
+    if not normalized_enhanced_text_value:
+        return []
+    if normalized_enhanced_text_value.lower() == normalized_global_text_value.lower():
+        return []
+    if not normalized_global_text_value:
+        # Enhanced present, global empty — no targets to check.
+        return []
+    accumulated_warnings_for_this_section_list = []
+    for one_target_word_from_global in normalized_global_text_value.split():
+        if not one_target_word_from_global:
+            continue
+        per_word_pattern = _build_per_word_boundary_regex_pattern_for_one_target_word(
+            one_target_word_from_global
+        )
+        if not per_word_pattern.search(normalized_enhanced_text_value):
+            accumulated_warnings_for_this_section_list.append(
+                f"Section {section_one_based_index}: target word "
+                f"'{one_target_word_from_global}' not found in enhanced text — "
+                f"will have no isolation effect at that word's position."
+            )
+    return accumulated_warnings_for_this_section_list
+
+
+@PromptServer.instance.routes.post(
+    V3_TARGET_WORDS_NOT_FOUND_IN_ENHANCED_WARNING_HTTP_ENDPOINT_PATH
+)
+async def v3_check_target_words_present_in_enhanced_text_http_route_handler(request):
+    """
+    Request body JSON:
+        {"sections": [
+            {"global_text": str, "enhanced_text": str},
+            ...
+         ]}
+    Response body JSON:
+        {"messages": ["Section N: target word 'foo' not found in enhanced text — ...", ...]}
+
+    Sections are 1-indexed in messages (matches the user-visible section
+    numbering in the node UI). Empty `messages` list when all sections
+    pass (or are passthroughs).
+    """
+    try:
+        request_body_json_payload = await request.json()
+    except Exception:
+        return web.json_response(
+            {"messages": ["[v3 target-word check request body was not valid JSON]"]},
+            status=400,
+        )
+    per_section_global_and_enhanced_pairs_list = request_body_json_payload.get("sections", [])
+    if not isinstance(per_section_global_and_enhanced_pairs_list, list):
+        return web.json_response(
+            {"messages": ["[v3 target-word check request must include list-typed 'sections']"]},
+            status=400,
+        )
+    accumulated_messages_across_all_sections_list = []
+    for one_zero_based_section_array_index, one_section_dict in enumerate(
+        per_section_global_and_enhanced_pairs_list
+    ):
+        if not isinstance(one_section_dict, dict):
+            continue
+        one_based_section_index_for_display = one_zero_based_section_array_index + 1
+        global_text_value_or_empty = str(one_section_dict.get("global_text", "") or "")
+        enhanced_text_value_or_empty = str(one_section_dict.get("enhanced_text", "") or "")
+        per_section_warnings = _identify_missing_target_words_for_one_v3_section_global_in_enhanced(
+            one_based_section_index_for_display,
+            global_text_value_or_empty,
+            enhanced_text_value_or_empty,
+        )
+        accumulated_messages_across_all_sections_list.extend(per_section_warnings)
+    return web.json_response({"messages": accumulated_messages_across_all_sections_list})
+
+
+logging.info("unified-conditioning-merge: registered HTTP routes for realtime embedding validation + v3 target-word check.")
