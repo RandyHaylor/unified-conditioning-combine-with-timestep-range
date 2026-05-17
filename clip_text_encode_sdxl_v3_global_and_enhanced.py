@@ -1290,3 +1290,23 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
             [[raw_tokens_tensor, upscaled_entry_metadata_dict]],
             reference_base_prompt_text_for_g_stream,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Public aliases for shared use by the chain-based detail-isolation node
+# pair (CLIPTextEncodeSDXLEnhancedDetailIsolation + Section). These are
+# explicit re-exports of v3's encoding helpers under non-underscore
+# names so sibling nodes can import them without reaching into
+# private-prefixed symbols. Same implementation, public-facing names.
+#
+# This is an intentional, documented shared-API contract. v3's internal
+# call sites continue to use the underscore names. Sibling nodes import
+# the public names below.
+# ──────────────────────────────────────────────────────────────────────
+
+apply_v3_per_text_transforms_to_one_text_string = _apply_v3_per_text_transforms_to_one_text_string
+encode_active_v3_sections_into_one_sdxl_conditioning_entry = _encode_active_v3_sections_into_one_sdxl_conditioning_entry
+build_per_stream_base_prompt_text_and_per_section_base_fragment_list = _build_per_stream_base_prompt_text_and_per_section_base_fragment_list
+compute_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields
+resolve_target_image_width_and_height_from_optional_latent_or_defaults = _resolve_target_image_width_and_height_from_optional_latent_or_defaults
+clamp_numeric_value_inclusive = _clamp_numeric_value_inclusive

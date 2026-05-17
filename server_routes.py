@@ -308,4 +308,134 @@ async def v3_check_target_words_present_in_enhanced_text_http_route_handler(requ
     return web.json_response({"messages": accumulated_messages_across_all_sections_list})
 
 
-logging.info("unified-conditioning-merge: registered HTTP routes for realtime embedding validation + v3 target-word check.")
+# ──────────────────────────────────────────────────────────────────────
+# Combined per-section validator for the detail-isolation Section node.
+#
+# A single endpoint that, for ONE section's (global_text, enhanced_text,
+# filter_known_a1111_embedding_tags_not_installed_locally), runs BOTH
+# the embedding-issue scan AND the target-word-not-in-enhanced check and
+# returns a single merged list of warning messages.
+#
+# Different from the v1/v3 endpoints in that:
+#   - Operates per-section, not on a list of section texts.
+#   - Reports both classes of issue in one response so the section
+#     node's bottom validator widget only needs one round-trip per edit.
+# ──────────────────────────────────────────────────────────────────────
+
+DETAIL_ISOLATION_SECTION_COMBINED_VALIDATOR_HTTP_ENDPOINT_PATH = (
+    "/unified-conditioning-merge/detail_isolation_section_combined_validator"
+)
+
+
+@PromptServer.instance.routes.post(
+    DETAIL_ISOLATION_SECTION_COMBINED_VALIDATOR_HTTP_ENDPOINT_PATH
+)
+async def detail_isolation_section_combined_validator_http_route_handler(request):
+    """
+    Request body JSON:
+        {
+            "global_text": str,
+            "enhanced_text": str,
+            "filter_known_a1111_embedding_tags_not_installed_locally": bool (default True),
+        }
+    Response body JSON:
+        {"messages": [
+            "<embedding issue line>",
+            "<target word missing line>",
+            ...
+         ]}
+    Empty `messages` list when no issues detected.
+    """
+    try:
+        request_body_json_payload = await request.json()
+    except Exception:
+        return web.json_response(
+            {"messages": ["[combined section validator request body was not valid JSON]"]},
+            status=400,
+        )
+    raw_global_text_value = str(request_body_json_payload.get("global_text", "") or "")
+    raw_enhanced_text_value = str(request_body_json_payload.get("enhanced_text", "") or "")
+    filter_orphan_setting = bool(
+        request_body_json_payload.get(
+            "filter_known_a1111_embedding_tags_not_installed_locally", True
+        )
+    )
+
+    combined_messages_for_this_section_list = []
+
+    # --- (1) Target-word-not-in-enhanced check (always runs).
+    target_word_check_warnings_for_this_one_section = (
+        _identify_missing_target_words_for_one_v3_section_global_in_enhanced(
+            1, raw_global_text_value, raw_enhanced_text_value
+        )
+    )
+    # Section-level endpoint: strip the "Section 1:" prefix the v3 helper
+    # prepends, since on a per-section node there's no section number to
+    # report — the warning is implicitly about THIS section.
+    for one_target_word_warning_line in target_word_check_warnings_for_this_one_section:
+        line_with_section_prefix_stripped = one_target_word_warning_line
+        if line_with_section_prefix_stripped.startswith("Section 1: "):
+            line_with_section_prefix_stripped = line_with_section_prefix_stripped[len("Section 1: "):]
+            line_with_section_prefix_stripped = (
+                line_with_section_prefix_stripped[0].upper()
+                + line_with_section_prefix_stripped[1:]
+                if line_with_section_prefix_stripped else line_with_section_prefix_stripped
+            )
+        combined_messages_for_this_section_list.append(line_with_section_prefix_stripped)
+
+    # --- (2) Embedding-issue scan over BOTH global_text and enhanced_text.
+    embedding_index_map = get_cached_or_build_embedding_lowercase_stem_to_index_entry_map()
+    known_a1111_embedding_names_lowercase_set_from_file = set()
+    if filter_orphan_setting:
+        try:
+            from .clip_text_encode_with_cutoff_region_separation import (
+                _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set,
+            )
+            known_a1111_embedding_names_lowercase_set_from_file = (
+                _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set()
+            )
+        except Exception:
+            pass
+
+    accumulated_embedding_references_across_both_texts_set = set()
+    for one_input_text_to_scan in (raw_global_text_value, raw_enhanced_text_value):
+        accumulated_embedding_references_across_both_texts_set |= (
+            _collect_all_embedding_references_appearing_in_one_prompt_text(
+                one_input_text_to_scan, embedding_index_map
+            )
+        )
+    sorted_embedding_references_for_stable_output_order = sorted(
+        accumulated_embedding_references_across_both_texts_set,
+        key=lambda triple: (triple[1], triple[0]),
+    )
+    for (
+        name_used_in_prompt,
+        lowercase_stem_for_lookup,
+        is_a1111_bare_style_reference,
+    ) in sorted_embedding_references_for_stable_output_order:
+        if lowercase_stem_for_lookup not in embedding_index_map:
+            if (
+                is_a1111_bare_style_reference
+                and lowercase_stem_for_lookup in known_a1111_embedding_names_lowercase_set_from_file
+            ):
+                combined_messages_for_this_section_list.append(
+                    f"Embedding {name_used_in_prompt} not installed locally, "
+                    f"will be stripped (orphan A1111 tag filter)"
+                )
+            else:
+                combined_messages_for_this_section_list.append(
+                    f"Embedding {name_used_in_prompt} not found in system, will be ignored"
+                )
+            continue
+        index_entry_for_this_embedding = embedding_index_map[lowercase_stem_for_lookup]
+        if not is_embedding_file_fully_compatible_with_sdxl_based_on_its_tensor_last_dim_set(
+            index_entry_for_this_embedding["tensor_last_dim_set"]
+        ):
+            combined_messages_for_this_section_list.append(
+                f"Embedding {name_used_in_prompt} incompatible with SDXL, will be ignored"
+            )
+
+    return web.json_response({"messages": combined_messages_for_this_section_list})
+
+
+logging.info("unified-conditioning-merge: registered HTTP routes for realtime embedding validation + v3 target-word check + detail-isolation section combined validator.")
