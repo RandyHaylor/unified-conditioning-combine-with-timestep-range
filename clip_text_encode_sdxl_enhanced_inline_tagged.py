@@ -261,6 +261,15 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
                     "min": UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
                     "step": 0.01,
                 }),
+                "enable_region_detail_processing": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "ON: parse REGION/DETAIL tags and apply cutoff isolation math. "
+                        "OFF: strip tags from the prompt and encode the plain text as a "
+                        "single passthrough (no isolation). Useful for A/B comparing the "
+                        "isolation effect against plain CLIP encoding of the same prompt."
+                    ),
+                }),
                 "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
                 "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
                 "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {
@@ -304,6 +313,7 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         clip,
         inline_tagged_prompt_text,
         upscaled_conditioning_multiplier,
+        enable_region_detail_processing,
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
@@ -312,11 +322,42 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         offset_y,
         latent=None,
     ):
-        parsed_section_descriptors_list = (
-            _parse_inline_tagged_prompt_into_section_descriptors_in_textual_order(
-                str(inline_tagged_prompt_text or "")
+        raw_user_text_value = str(inline_tagged_prompt_text or "")
+        if not bool(enable_region_detail_processing):
+            # A/B-test mode: strip ALL <REGION>...</REGION> and <DETAIL>...</DETAIL>
+            # tags from the user's text and treat the result as a single
+            # passthrough section. No cutoff math runs; this should produce
+            # the same conditioning as feeding the plain text into a stock
+            # CLIPTextEncode of equivalent SDXL geometry.
+            text_with_detail_tags_inlined = DETAIL_BLOCK_REGEX_PATTERN.sub(
+                lambda match: match.group(1), raw_user_text_value
             )
-        )
+            text_with_region_tags_inlined_too = REGION_BLOCK_REGEX_PATTERN.sub(
+                lambda match: match.group(1), text_with_detail_tags_inlined
+            )
+            plain_text_with_all_tags_stripped = (
+                _normalize_runs_of_whitespace_to_single_space_and_strip_outer(
+                    text_with_region_tags_inlined_too
+                )
+            )
+            parsed_section_descriptors_list = []
+            if plain_text_with_all_tags_stripped:
+                parsed_section_descriptors_list.append({
+                    "section_id_one_based": 1,
+                    "global_text": plain_text_with_all_tags_stripped,
+                    "enhanced_text": plain_text_with_all_tags_stripped,
+                    "global_text_weight": 1.0,
+                    "enhanced_text_weight": 1.0,
+                    "clip_l_strength": 1.0,
+                    "clip_g_strength": 1.0,
+                    "is_true_region": False,
+                })
+        else:
+            parsed_section_descriptors_list = (
+                _parse_inline_tagged_prompt_into_section_descriptors_in_textual_order(
+                    raw_user_text_value
+                )
+            )
 
         # Apply v3-style per-section text transforms (A1111 rewrite,
         # unsupported-embedding strip, orphan-tag filter, shape-mismatch
