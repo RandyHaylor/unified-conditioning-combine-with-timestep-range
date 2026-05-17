@@ -509,6 +509,85 @@ def _warn_about_each_mismatched_shape_embedding_reference_in_prompt_text(prompt_
                             break
 
 
+_EMBEDDING_REFERENCE_AS_A_COMMA_PART_REGEX_PATTERN = re.compile(
+    r"^\(?\s*embedding:([\w./\\-]+)\s*(?::\s*[0-9.]+\s*)?\)?$"
+)
+
+
+def _detect_whether_any_stream_has_a_shape_mismatched_tensor_for_this_embedding(
+    embedding_name_string, clip_object
+):
+    """Tokenizes `embedding:NAME` in isolation and checks per stream whether
+    the loaded embedding tensor's last dim matches that stream's expected
+    embedding_size. Returns True if ANY stream mismatches."""
+    try:
+        isolated_tokenization_per_stream = clip_object.tokenize(f"embedding:{embedding_name_string}")
+    except Exception:
+        return False
+    if not isinstance(isolated_tokenization_per_stream, dict):
+        return False
+    top_level_tokenizer_object_or_none = getattr(clip_object, "tokenizer", None)
+    for stream_name_key, chunks_list_for_this_stream in isolated_tokenization_per_stream.items():
+        if not isinstance(chunks_list_for_this_stream, list):
+            continue
+        per_stream_tokenizer_object_or_none = (
+            getattr(top_level_tokenizer_object_or_none, stream_name_key, None)
+            if top_level_tokenizer_object_or_none is not None
+            else None
+        )
+        expected_hidden_dim_for_this_stream = getattr(
+            per_stream_tokenizer_object_or_none, "embedding_size", None
+        )
+        if expected_hidden_dim_for_this_stream is None:
+            continue
+        for one_chunk_of_token_weight_pairs in chunks_list_for_this_stream:
+            for token_id_or_embedding_tensor, _weight in one_chunk_of_token_weight_pairs:
+                if isinstance(token_id_or_embedding_tensor, torch.Tensor):
+                    if token_id_or_embedding_tensor.shape[-1] != expected_hidden_dim_for_this_stream:
+                        return True
+    return False
+
+
+def _strip_unsupported_embedding_references_from_prompt_text(prompt_text_string, clip_object):
+    """
+    Walks the comma-separated parts of `prompt_text_string`. For any part that
+    is exactly an `embedding:NAME` reference (with or without parens and
+    `:weight`), checks whether the embedding's tensor shape matches the
+    current model's CLIP stream(s). If ANY stream mismatches, drops that
+    part entirely from the prompt and logs an INFO line.
+
+    Returns the modified prompt text. Embeddings that fit all streams pass
+    through untouched, as do non-embedding tags.
+    """
+    if not prompt_text_string:
+        return prompt_text_string
+
+    surviving_comma_separated_parts = []
+    for raw_comma_separated_part in prompt_text_string.split(","):
+        stripped_part_text_for_pattern_match = raw_comma_separated_part.strip()
+        if not stripped_part_text_for_pattern_match:
+            continue
+        embedding_reference_match = _EMBEDDING_REFERENCE_AS_A_COMMA_PART_REGEX_PATTERN.match(
+            stripped_part_text_for_pattern_match
+        )
+        if embedding_reference_match is None:
+            surviving_comma_separated_parts.append(raw_comma_separated_part)
+            continue
+        embedding_name_from_this_reference = embedding_reference_match.group(1)
+        if _detect_whether_any_stream_has_a_shape_mismatched_tensor_for_this_embedding(
+            embedding_name_from_this_reference, clip_object
+        ):
+            logging.info(
+                f"Removed unsupported embedding 'embedding:{embedding_name_from_this_reference}' "
+                f"from prompt because its tensor shape does not match this model's CLIP stream(s) "
+                f"(remove_text_for_unsupported_embeddings is enabled)."
+            )
+            continue
+        surviving_comma_separated_parts.append(raw_comma_separated_part)
+
+    return ", ".join(part.strip() for part in surviving_comma_separated_parts if part.strip())
+
+
 def _encode_one_group_via_plain_stock_clip_without_any_isolation(
     clip_object,
     section_descriptors_in_group_list,
@@ -562,6 +641,8 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     mask_token_string,
     strict_mask_value,
     start_from_masked_value,
+    support_a1111_style_embedding_text_setting=True,
+    remove_text_for_unsupported_embeddings_setting=True,
 ):
     """
     Returns a single CONDITIONING entry [combined_tokens_tensor, metadata_dict]
@@ -575,18 +656,30 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     # A1111-style sweep: identify bare tags that exactly match an embedding
     # filename stem (case-insensitive) and rewrite them to ComfyUI's
     # `embedding:NAME` form so the tokenizer loads them. Logs each rewrite
-    # and warns when multiple files share the same stem.
-    group_full_prompt_text_for_isolate_streams = (
-        _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form(
-            group_full_prompt_text_for_isolate_streams
+    # and warns when multiple files share the same stem. User-toggleable.
+    if support_a1111_style_embedding_text_setting:
+        group_full_prompt_text_for_isolate_streams = (
+            _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form(
+                group_full_prompt_text_for_isolate_streams
+            )
         )
-    )
     # Pre-scan for embedding files whose dim doesn't match this model's
     # streams, so the user sees the FILE NAME of the offending embedding
     # (stock's own warning only prints dims, not the name).
     _warn_about_each_mismatched_shape_embedding_reference_in_prompt_text(
         group_full_prompt_text_for_isolate_streams, clip_object
     )
+    # If the user has chosen to drop unsupported embeddings entirely, strip
+    # every `embedding:NAME` reference whose file's dim won't match this
+    # model's streams from the prompt text. The reference vanishes from the
+    # prompt before tokenization — no tensor gets loaded, no pad/truncate
+    # salvage runs, no influence on the image.
+    if remove_text_for_unsupported_embeddings_setting:
+        group_full_prompt_text_for_isolate_streams = (
+            _strip_unsupported_embedding_references_from_prompt_text(
+                group_full_prompt_text_for_isolate_streams, clip_object
+            )
+        )
     isolate_target_text_and_weight_pairs_for_this_group = _build_isolate_target_text_and_weight_pairs_for_one_group(
         section_descriptors_in_group_list
     )
@@ -733,6 +826,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                 "max": OFFSET_MAXIMUM_VALUE,
                 "step": 0.01,
             }),
+            "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
+            "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
         }
         for section_index_for_declaration in range(1, MAX_SECTION_COUNT_SUPPORTED + 1):
             required_inputs_dict[f"section_{section_index_for_declaration}_text"] = (
@@ -772,6 +867,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         zoom,
         offset_x,
         offset_y,
+        support_a1111_style_embedding_text=True,
+        remove_text_for_unsupported_embeddings=True,
         latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
@@ -840,6 +937,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                 empty_conditioning_entry = _encode_one_group_into_one_sdxl_conditioning_entry(
                     clip, [], CLIP_STREAM_PASS_BOTH_L_AND_G, join_separator,
                     mask_token, float(strict_mask), float(start_from_masked),
+                    support_a1111_style_embedding_text_setting=bool(support_a1111_style_embedding_text),
+                    remove_text_for_unsupported_embeddings_setting=bool(remove_text_for_unsupported_embeddings),
                 )
                 raw_conditioning_entries_collected_across_all_groups.append(empty_conditioning_entry)
             except Exception as encoding_failure_for_empty_prompt:
@@ -875,6 +974,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                             mask_token,
                             float(strict_mask),
                             float(start_from_masked),
+                            support_a1111_style_embedding_text_setting=bool(support_a1111_style_embedding_text),
+                            remove_text_for_unsupported_embeddings_setting=bool(remove_text_for_unsupported_embeddings),
                         )
                         raw_conditioning_entries_collected_across_all_groups.append(group_conditioning_entry)
                 except Exception as group_encoding_failure:
