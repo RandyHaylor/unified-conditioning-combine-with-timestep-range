@@ -27,7 +27,7 @@ const NODE_TYPE_NAME_FOR_THIS_EXTENSION = "CLIPTextEncodeSDXLV3GlobalAndEnhanced
 //   section_N_enhanced_text_weight
 //   section_N_clip_l_strength
 //   section_N_clip_g_strength
-const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(global_text|enhanced_text|global_text_weight|enhanced_text_weight|clip_l_strength|clip_g_strength|blend_enhanced_text_into_global_prompt)$/;
+const SECTION_WIDGET_NAME_REGEX = /^section_(\d+)_(global_text|enhanced_text|global_text_weight|enhanced_text_weight|clip_l_strength|clip_g_strength)$/;
 // Anchor on global_text for header insertion (first widget per section).
 const SECTION_GLOBAL_TEXT_WIDGET_NAME_REGEX = /^section_(\d+)_global_text$/;
 const SECTION_HEADER_WIDGET_NAME_PREFIX = "__v3_section_header_for_index_";
