@@ -88,17 +88,53 @@ def _flatten_chunked_token_weight_pairs_into_content_token_ids_skipping_start_en
             if index_within_chunk == 0:
                 # Skip the start token at the beginning of every chunk.
                 continue
-            if token_id_in_pair == end_token_id_for_this_stream:
+            # The "token id" can be a torch.Tensor when the user-provided
+            # prompt referenced an embedding file (`embedding:foo`). In that
+            # case it is NOT the end-of-text marker — it's a content token
+            # carrying the embedding's vector. Direct `==` against an int
+            # would raise "Boolean value of Tensor with more than one value
+            # is ambiguous", so we special-case tensors as never-equal-to-end.
+            token_id_in_pair_is_an_embedding_tensor = isinstance(token_id_in_pair, torch.Tensor)
+            if (not token_id_in_pair_is_an_embedding_tensor) and token_id_in_pair == end_token_id_for_this_stream:
                 # End token — stop reading this chunk's content.
                 break
             flat_content_token_ids_for_all_chunks_list.append(token_id_in_pair)
     return flat_content_token_ids_for_all_chunks_list
 
 
+def _two_token_ids_are_safely_equal_treating_embedding_tensors_as_never_equal(token_id_a, token_id_b):
+    """
+    Equality for the matcher that's safe against embedding-file tokens
+    (which are torch.Tensors, not ints). Two ints compare normally. Any
+    tensor on either side returns False — embedding-tensor tokens are
+    treated as opaque, non-matchable atoms for region matching purposes
+    (since the target text the user typed will tokenize to ints, never to
+    a tensor identical to a referenced embedding).
+    """
+    if isinstance(token_id_a, torch.Tensor) or isinstance(token_id_b, torch.Tensor):
+        return False
+    return token_id_a == token_id_b
+
+
+def _two_token_id_lists_are_safely_equal_treating_embedding_tensors_as_never_equal(list_a, list_b):
+    """List-level safe equality using the same tensor-as-never-equal rule."""
+    if len(list_a) != len(list_b):
+        return False
+    for elem_a, elem_b in zip(list_a, list_b):
+        if not _two_token_ids_are_safely_equal_treating_embedding_tensors_as_never_equal(elem_a, elem_b):
+            return False
+    return True
+
+
 def _find_all_sublist_match_start_positions_within_superlist(superlist, sublist):
     """
     Returns the list of start positions in superlist where sublist appears
     as a contiguous run. Returns empty list if sublist is empty.
+
+    Uses tensor-safe equality so that embedding-file tokens in the superlist
+    (which appear as torch.Tensors, not ints) don't trigger
+    "Boolean value of Tensor with more than one value is ambiguous" when
+    compared to int tokens from the user's target text.
     """
     if not sublist:
         return []
@@ -108,8 +144,15 @@ def _find_all_sublist_match_start_positions_within_superlist(superlist, sublist)
     if sublist_length > superlist_length:
         return []
     for candidate_start_position in range(superlist_length - sublist_length + 1):
-        if superlist[candidate_start_position] == sublist[0]:
-            if superlist[candidate_start_position : candidate_start_position + sublist_length] == sublist:
+        if _two_token_ids_are_safely_equal_treating_embedding_tensors_as_never_equal(
+            superlist[candidate_start_position], sublist[0]
+        ):
+            candidate_superlist_slice = superlist[
+                candidate_start_position : candidate_start_position + sublist_length
+            ]
+            if _two_token_id_lists_are_safely_equal_treating_embedding_tensors_as_never_equal(
+                candidate_superlist_slice, sublist
+            ):
                 matched_start_positions_list.append(candidate_start_position)
     return matched_start_positions_list
 
@@ -166,7 +209,10 @@ def _build_masked_tokens_per_chunk_by_replacing_target_positions_with_mask_token
             # For content positions, check the mask. For end/pad positions we
             # don't consume a mask slot — but we need to keep our iterator
             # aligned to CHUNK_CONTENT_TOKEN_COUNT_EXCLUDING_MARKERS per chunk.
-            if token_id_in_pair == end_token_id:
+            # If the "token id" is actually a torch.Tensor it's an embedding-
+            # file token, NOT end-of-text; treat it as content.
+            token_id_in_pair_is_an_embedding_tensor = isinstance(token_id_in_pair, torch.Tensor)
+            if (not token_id_in_pair_is_an_embedding_tensor) and token_id_in_pair == end_token_id:
                 # Once we hit end-of-text inside a chunk, the rest is padding.
                 # The mask was built ONLY for content positions, but we may
                 # need to advance the iterator to the next chunk's content
