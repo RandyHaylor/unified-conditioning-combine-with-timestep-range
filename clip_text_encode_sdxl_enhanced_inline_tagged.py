@@ -234,11 +234,12 @@ def _parse_inline_tagged_prompt_into_section_descriptors_in_textual_order(
 
 
 INLINE_TAGGED_PROMPT_PLACEHOLDER_HELP_TEXT = (
-    "Type your prompt with optional <REGION>...</REGION> and <DETAIL>...</DETAIL> tags.\n"
+    # Header instructions are drawn ABOVE this field by the frontend
+    # extension (web/clip_text_encode_sdxl_enhanced_inline_tagged.js).
+    # The placeholder stays minimal — just the example — since the
+    # syntax docs are visible up there permanently.
     "Example: <REGION>a <DETAIL>gnarled old</DETAIL> tree</REGION>, "
-    "<REGION>a bird <DETAIL>red eyes</DETAIL></REGION>\n"
-    "Tags are stripped from the natural prompt; DETAIL words get cutoff-style "
-    "isolation (masked from OTHER regions' attention)."
+    "<REGION>a bird <DETAIL>red eyes</DETAIL></REGION>"
 )
 
 
