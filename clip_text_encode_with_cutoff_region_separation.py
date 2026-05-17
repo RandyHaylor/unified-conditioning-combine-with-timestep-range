@@ -390,8 +390,9 @@ def _warn_about_each_mismatched_shape_embedding_reference_in_prompt_text(prompt_
                                     f"(got dim {actual_last_dim_of_embedding_tensor}, "
                                     f"model expects dim {expected_dim}). "
                                     f"Embedding may be designed for another model. "
-                                    f"The stock encoder will ignore it (drop + pad with empty tokens). "
-                                    f"Results may be unexpected."
+                                    f"This node will pad/truncate it to fit so the embedding still contributes "
+                                    f"some signal (rather than being silently dropped), but its semantic content "
+                                    f"will be distorted. Results may be unexpected."
                                 )
                                 embedding_names_already_warned_for_per_stream.add(dedup_key_for_this_specific_warning)
                             mismatch_already_detected_for_this_stream_for_this_embedding = True

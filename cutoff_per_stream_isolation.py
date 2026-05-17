@@ -39,6 +39,8 @@ texts to L and G independently — the missing feature in the original
 single-text cutoff that made per-stream routing impossible.
 """
 
+import logging
+
 import numpy as np
 import torch
 
@@ -254,6 +256,61 @@ def _resolve_mask_token_id_from_user_string_with_default(per_stream_tokenizer, m
     return tokenized_input_ids_for_mask_token_string[0]
 
 
+def _pad_or_truncate_embedding_tensor_last_dim_to_match_expected_dim(embedding_tensor, expected_last_dim):
+    """
+    Returns a copy of `embedding_tensor` whose last dim equals
+    `expected_last_dim`. Pads with zeros if shorter, truncates if longer.
+    Other dims are preserved.
+    """
+    current_last_dim = embedding_tensor.shape[-1]
+    if current_last_dim == expected_last_dim:
+        return embedding_tensor
+    if current_last_dim < expected_last_dim:
+        pad_length = expected_last_dim - current_last_dim
+        zero_pad_shape = list(embedding_tensor.shape)
+        zero_pad_shape[-1] = pad_length
+        zero_pad_tensor = torch.zeros(
+            zero_pad_shape, dtype=embedding_tensor.dtype, device=embedding_tensor.device
+        )
+        return torch.cat([embedding_tensor, zero_pad_tensor], dim=-1)
+    return embedding_tensor[..., :expected_last_dim]
+
+
+def _reshape_any_mismatched_embedding_tensors_in_chunks_list_in_place_to_match_stream_expected_dim(
+    chunks_list, expected_last_dim_for_this_stream, stream_key_for_log_only
+):
+    """
+    Walks chunks_list and replaces any token-pair whose token-id slot holds a
+    torch.Tensor with a wrong last-dim with a padded/truncated copy that
+    matches `expected_last_dim_for_this_stream`. Mutates `chunks_list` in
+    place AND returns a list of (chunk_index, position_index, old_dim) tuples
+    describing what was reshaped, for the caller to log.
+
+    This prevents the stock encoder's shape-mismatch drop branch from
+    triggering — by the time the encoder sees these tensors, their shapes
+    already match its expectations. Cost: zero-padded or truncated regions
+    are not part of the original embedding's training, so the model reads
+    them as out-of-distribution feature values. The embedding survives but
+    its semantic content is distorted.
+    """
+    reshape_actions_taken = []
+    for chunk_index_in_chunks_list, one_chunk_of_token_weight_pairs in enumerate(chunks_list):
+        for position_index_within_chunk, (token_id_or_tensor, weight_value) in enumerate(one_chunk_of_token_weight_pairs):
+            if not isinstance(token_id_or_tensor, torch.Tensor):
+                continue
+            existing_last_dim = token_id_or_tensor.shape[-1]
+            if existing_last_dim == expected_last_dim_for_this_stream:
+                continue
+            reshaped_tensor = _pad_or_truncate_embedding_tensor_last_dim_to_match_expected_dim(
+                token_id_or_tensor, expected_last_dim_for_this_stream
+            )
+            one_chunk_of_token_weight_pairs[position_index_within_chunk] = (reshaped_tensor, weight_value)
+            reshape_actions_taken.append(
+                (chunk_index_in_chunks_list, position_index_within_chunk, existing_last_dim)
+            )
+    return reshape_actions_taken
+
+
 def encode_one_stream_with_cutoff_style_region_isolation(
     clip_object,
     stream_key,
@@ -279,6 +336,33 @@ def encode_one_stream_with_cutoff_style_region_isolation(
     # Tokenize the full prompt for this stream.
     base_tokens_per_chunk_list = per_stream_tokenizer.tokenize_with_weights(full_prompt_text_for_this_stream)
     number_of_chunks_after_tokenization = len(base_tokens_per_chunk_list)
+
+    # If the prompt referenced embedding files whose dim doesn't match this
+    # stream's expected dim (e.g. SD1.5 768-dim embedding in SDXL G stream),
+    # pad/truncate them in-place so the stock encoder's shape-check doesn't
+    # drop them. Stretching an embedding to fit a different model is
+    # semantically lossy (the padded/clipped dims are out-of-distribution
+    # for that encoder), but it at least lets the embedding contribute SOME
+    # signal instead of being silently ignored.
+    expected_last_dim_for_this_stream = getattr(per_stream_tokenizer, "embedding_size", None)
+    if expected_last_dim_for_this_stream is not None:
+        reshape_actions_taken_for_this_stream = (
+            _reshape_any_mismatched_embedding_tensors_in_chunks_list_in_place_to_match_stream_expected_dim(
+                base_tokens_per_chunk_list,
+                expected_last_dim_for_this_stream,
+                stream_key,
+            )
+        )
+        if reshape_actions_taken_for_this_stream:
+            for chunk_index, position_index, old_dim in reshape_actions_taken_for_this_stream:
+                logging.warning(
+                    f"Cutoff cross-model embedding reshape: stream CLIP-{stream_key.upper()} "
+                    f"chunk[{chunk_index}] position[{position_index}] — "
+                    f"embedding tensor reshaped from dim {old_dim} to dim {expected_last_dim_for_this_stream} "
+                    f"({'zero-padded (was smaller)' if old_dim < expected_last_dim_for_this_stream else 'truncated (was larger)'}). "
+                    f"The original embedding was designed for a model with dim {old_dim}; "
+                    f"reshaping it lets this stream use it but its semantic content is distorted."
+                )
 
     # Encode base (unmasked) full prompt.
     base_embedding_tensor, base_pooled_tensor_or_none = per_stream_clip_text_encoder_model.encode_token_weights(
