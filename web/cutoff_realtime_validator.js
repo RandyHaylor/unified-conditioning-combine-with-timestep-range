@@ -23,12 +23,6 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 
-const NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS = new Set([
-  "CLIPTextEncodeWithCutoffRegionSeparation",
-  "CLIPTextEncodeSDXLV2WithIsolationAmount",
-]);
-// Legacy single-value alias preserved for any external code that imported
-// it. New checks use NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS.has(name).
 const NODE_TYPE_NAME_THIS_EXTENSION_TARGETS = "CLIPTextEncodeWithCutoffRegionSeparation";
 const VALIDATION_STATUS_READ_ONLY_WIDGET_NAME = "validation_status";
 const KEYSTROKE_DEBOUNCE_DELAY_MILLISECONDS = 400;
@@ -54,13 +48,11 @@ function debounce_function_invocation_until_no_call_for_this_many_ms(
 }
 
 function widget_is_one_of_the_per_section_prompt_text_widgets(widget_object) {
-  // Matches both v1 `section_N_text` and v2 `region_N_text` widget names.
-  if (!widget_object || !widget_object.name) return false;
-  const ends_with_text_suffix = widget_object.name.endsWith("_text");
-  if (!ends_with_text_suffix) return false;
   return (
-    widget_object.name.startsWith("section_")
-    || widget_object.name.startsWith("region_")
+    widget_object
+    && widget_object.name
+    && widget_object.name.startsWith("section_")
+    && widget_object.name.endsWith("_text")
   );
 }
 
@@ -177,7 +169,7 @@ function add_read_only_validation_status_widget_to_node_if_not_already_present(n
 app.registerExtension({
   name: "UnifiedConditioningMerge.CutoffRealtimeValidator",
   async nodeCreated(node) {
-    if (!node || !node.constructor || !NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS.has(node.constructor.type)) {
+    if (!node || !node.constructor || node.constructor.type !== NODE_TYPE_NAME_THIS_EXTENSION_TARGETS) {
       return;
     }
 
