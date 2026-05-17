@@ -70,13 +70,20 @@ function ensureSectionHeaderWidgetsAreInsertedBeforeEachSectionTextWidget(node) 
         canvas_context.save();
         canvas_context.fillStyle = "#9aa";
         canvas_context.font = "bold 11px Arial, sans-serif";
-        canvas_context.textBaseline = "middle";
+        // Draw label near the BOTTOM of the widget's vertical extent so the
+        // visual whitespace sits ABOVE the header, not below it. The next
+        // widget (section text area) then visually tucks right under the
+        // header label.
+        canvas_context.textBaseline = "bottom";
         const header_label_text = "── section " + this.__section_index_for_header_display_only + " ──";
-        canvas_context.fillText(header_label_text, 12, y_top_pixels + widget_height_pixels / 2);
+        const text_baseline_y_position_just_above_widget_bottom = y_top_pixels + widget_height_pixels - 2;
+        canvas_context.fillText(header_label_text, 12, text_baseline_y_position_just_above_widget_bottom);
         canvas_context.restore();
       },
       computeSize(available_widget_width_pixels) {
-        return [available_widget_width_pixels, 16];
+        // Taller than the previous 16px so the new empty space (formerly
+        // below) now appears above the label.
+        return [available_widget_width_pixels, 24];
       },
     };
     node.widgets.splice(widget_index_iterator_position, 0, new_section_header_widget_to_insert);
