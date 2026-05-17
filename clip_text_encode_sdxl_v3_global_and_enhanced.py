@@ -164,8 +164,18 @@ def _collect_active_v3_section_descriptors_from_kwargs_in_declaration_order(
     Reads each section's six widgets:
       - section_N_global_text          (STRING multiline)
       - section_N_enhanced_text        (STRING multiline)
-      - section_N_global_text_weight   (FLOAT)
-      - section_N_enhanced_text_weight (FLOAT)
+      - section_N_global_text_weight   (FLOAT) — CLIP attention weight on
+          this section's contribution to the natural base prompt.
+      - section_N_enhanced_text_weight (FLOAT) — magnitude of this section's
+          cutoff overlay (the "isolation strength"). When blend < 1, drives
+          how strongly the cleaner per-region embedding overlays the base
+          at this section's region positions.
+      - section_N_blend_enhanced_text_into_global_prompt (FLOAT, 0..1) —
+          0 = enhanced text stays region-only (full cutoff isolation).
+          1 = enhanced text fully visible in the natural prompt globally.
+          Intermediate values split: enhanced appears in base at weight
+          (blend × enhanced_text_weight) AND drives the per-region overlay
+          at weight ((1-blend) × enhanced_text_weight).
       - section_N_clip_l_strength      (FLOAT, 0 = exclude from L)
       - section_N_clip_g_strength      (FLOAT, 0 = exclude from G)
 
@@ -215,6 +225,11 @@ def _collect_active_v3_section_descriptors_from_kwargs_in_declaration_order(
                     f"section_{one_based_section_index}_clip_g_strength", 1.0
                 )
             ),
+            "blend_enhanced_text_into_global_prompt": float(
+                kwargs_with_per_section_widget_values.get(
+                    f"section_{one_based_section_index}_blend_enhanced_text_into_global_prompt", 0.0
+                )
+            ),
             "is_true_region": enhanced_is_meaningfully_different_from_global,
         })
     return collected_section_descriptor_list_in_declaration_order
@@ -226,32 +241,80 @@ def _select_per_stream_strength_value_for_section(section_descriptor, stream_key
     return section_descriptor["clip_g_strength"]
 
 
-def _build_per_section_base_prompt_fragment_for_one_stream(section_descriptor, stream_key_l_or_g):
+def _build_per_section_base_prompt_fragment_list_for_one_stream(
+    section_descriptor, stream_key_l_or_g
+):
     """
-    Returns the `(text:weight)` fragment this section contributes to the
-    base prompt for the given stream, or None if the section is excluded
-    from this stream (stream strength == 0).
+    Architecture (v3 final design with blend slider):
 
-    If the section is a true region: use enhanced_text wrapped with
-    enhanced_text_weight × stream_strength.
-    If the section is a passthrough: use global_text wrapped with
-    global_text_weight × stream_strength.
-    If the chosen text is empty for some reason, returns None.
+      For ANY section (passthrough OR true region), the base prompt
+      gets `(global_text : global_text_weight × stream_strength)` —
+      the section's contribution to the natural user-visible prompt.
+
+      For TRUE REGION sections with `blend_enhanced_text_into_global_prompt`
+      > 0, the base prompt ALSO gets
+      `(enhanced_text : blend × enhanced_text_weight × stream_strength)`,
+      appended after the global fragments. This is the "leak the
+      detailed enhancement into the natural prompt globally" knob —
+      0 = enhanced stays region-only (full cutoff isolation), 1 =
+      enhanced is fully visible in the natural prompt (effectively
+      no isolation; same as the user just typing it all into global).
+
+    Returns a list of fragment strings (possibly empty if this section
+    is excluded from this stream via stream_strength == 0). The caller
+    comma-joins all sections' fragment lists in order to form the
+    base prompt.
     """
     per_stream_strength_value = _select_per_stream_strength_value_for_section(
         section_descriptor, stream_key_l_or_g
     )
     if per_stream_strength_value == 0:
+        return []
+    fragments_list = []
+    # Always emit the global contribution (this is the natural prompt text
+    # for this section's chunk).
+    section_global_text = section_descriptor.get("global_text") or ""
+    # Passthrough sections with empty global_text but non-empty enhanced_text
+    # fall back to enhanced_text as their natural prompt contribution.
+    if not section_global_text and not section_descriptor.get("is_true_region"):
+        section_global_text = section_descriptor.get("enhanced_text") or ""
+    if section_global_text:
+        global_weight_to_apply = (
+            float(section_descriptor.get("global_text_weight", 1.0)) * per_stream_strength_value
+        )
+        fragments_list.append(f"({section_global_text}:{round(global_weight_to_apply, 4)})")
+    # For true regions: if blend > 0, also emit the enhanced contribution.
+    if section_descriptor.get("is_true_region"):
+        blend_value = float(
+            section_descriptor.get("blend_enhanced_text_into_global_prompt", 0.0)
+        )
+        blend_value_clamped_inclusive_zero_to_one = max(0.0, min(1.0, blend_value))
+        if blend_value_clamped_inclusive_zero_to_one > 0.0:
+            section_enhanced_text = section_descriptor.get("enhanced_text") or ""
+            if section_enhanced_text:
+                enhanced_global_blend_weight_to_apply = (
+                    float(section_descriptor.get("enhanced_text_weight", 1.0))
+                    * blend_value_clamped_inclusive_zero_to_one
+                    * per_stream_strength_value
+                )
+                fragments_list.append(
+                    f"({section_enhanced_text}:{round(enhanced_global_blend_weight_to_apply, 4)})"
+                )
+    return fragments_list
+
+
+def _build_per_section_base_prompt_fragment_for_one_stream(section_descriptor, stream_key_l_or_g):
+    """
+    Backward-compatible single-fragment API kept for any external caller
+    that doesn't yet handle the new fragment-list contract. Returns the
+    first emitted fragment from the new list-returning helper, or None.
+    """
+    fragments_list = _build_per_section_base_prompt_fragment_list_for_one_stream(
+        section_descriptor, stream_key_l_or_g
+    )
+    if not fragments_list:
         return None
-    if section_descriptor["is_true_region"]:
-        text_to_wrap = section_descriptor["enhanced_text"]
-        weight_to_apply = section_descriptor["enhanced_text_weight"] * per_stream_strength_value
-    else:
-        text_to_wrap = section_descriptor["global_text"] or section_descriptor["enhanced_text"]
-        weight_to_apply = section_descriptor["global_text_weight"] * per_stream_strength_value
-    if not text_to_wrap:
-        return None
-    return f"({text_to_wrap}:{round(weight_to_apply, 4)})"
+    return fragments_list[0]
 
 
 def _pad_per_stream_tokenization_to_match_chunk_count(
@@ -684,12 +747,16 @@ def _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
     per_section_base_fragment_or_none_list = []
     base_prompt_text_parts_for_this_stream = []
     for section_descriptor in active_section_descriptors_list:
-        per_section_fragment_or_none = _build_per_section_base_prompt_fragment_for_one_stream(
+        per_section_fragment_list = _build_per_section_base_prompt_fragment_list_for_one_stream(
             section_descriptor, stream_key_l_or_g
         )
-        per_section_base_fragment_or_none_list.append(per_section_fragment_or_none)
-        if per_section_fragment_or_none is not None:
-            base_prompt_text_parts_for_this_stream.append(per_section_fragment_or_none)
+        # First fragment (the global contribution) identifies this section's
+        # natural-prompt anchor for downstream correlation.
+        per_section_base_fragment_or_none_list.append(
+            per_section_fragment_list[0] if per_section_fragment_list else None
+        )
+        # All fragments (global + optional blended-enhanced) enter the base prompt.
+        base_prompt_text_parts_for_this_stream.extend(per_section_fragment_list)
     return (
         ", ".join(base_prompt_text_parts_for_this_stream),
         per_section_base_fragment_or_none_list,
@@ -809,27 +876,33 @@ def _build_per_section_region_mask_over_content_positions_one_stream(
 ):
     """
     Region mask = positions in the base prompt where this section's
-    enhanced_text appears as a token sublist. For a true region, the
-    enhanced_text was inserted into the base prompt as a `(text:weight)`
-    fragment so it WILL appear there contiguously.
+    GLOBAL_TEXT appears as a token sublist. The base prompt now contains
+    each section's global_text as the natural-prompt anchor; the cutoff
+    overlay should land at those global_text positions (NOT at the
+    optional blended-enhanced portion of the base, which is purely a
+    "leak-into-globals" mechanism). The per-region encoding pass produces
+    a cleaner per-region embedding that gets overlaid here.
     """
     region_mask_one_dim = np.zeros(expected_content_position_count_across_all_chunks, dtype=int)
-    enhanced_text_tokens_per_chunk = per_stream_tokenizer.tokenize_with_weights(
-        section_descriptor["enhanced_text"]
+    region_anchor_text_for_position_lookup = section_descriptor.get("global_text") or ""
+    if not region_anchor_text_for_position_lookup:
+        return region_mask_one_dim
+    anchor_text_tokens_per_chunk = per_stream_tokenizer.tokenize_with_weights(
+        region_anchor_text_for_position_lookup
     )
-    enhanced_content_ids = (
+    anchor_content_ids = (
         _flatten_chunked_token_weight_pairs_into_content_token_ids_skipping_start_end_pad(
-            enhanced_text_tokens_per_chunk, end_token_id_for_this_stream
+            anchor_text_tokens_per_chunk, end_token_id_for_this_stream
         )
     )
-    if not enhanced_content_ids:
+    if not anchor_content_ids:
         return region_mask_one_dim
     match_start_positions = _find_all_sublist_match_start_positions_within_superlist(
-        base_content_token_ids_flat_list, enhanced_content_ids
+        base_content_token_ids_flat_list, anchor_content_ids
     )
-    enhanced_length_in_tokens = len(enhanced_content_ids)
+    anchor_length_in_tokens = len(anchor_content_ids)
     for one_match_start_position in match_start_positions:
-        one_match_end_exclusive = one_match_start_position + enhanced_length_in_tokens
+        one_match_end_exclusive = one_match_start_position + anchor_length_in_tokens
         if one_match_end_exclusive > expected_content_position_count_across_all_chunks:
             continue
         region_mask_one_dim[one_match_start_position : one_match_end_exclusive] = 1
@@ -933,8 +1006,23 @@ def _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
         per_section_strength_value = _select_per_stream_strength_value_for_section(
             section_descriptor, stream_key_l_or_g
         )
+        # New weight semantics (v3 final design):
+        #   enhanced_text_weight = cutoff overlay magnitude (the "isolation strength").
+        #   blend_enhanced_text_into_global_prompt 0..1 = how much enhanced
+        #       leaks into the base prompt globally. The complementary
+        #       (1 - blend) portion drives the per-region overlay.
+        # Effective overlay weight = enhanced_text_weight × (1 - blend) × stream_strength.
+        # When blend == 1: overlay weight is 0 → no per-region effect (enhanced
+        # is fully in the base prompt globally).
+        blend_value = float(
+            section_descriptor.get("blend_enhanced_text_into_global_prompt", 0.0)
+        )
+        blend_value_clamped = max(0.0, min(1.0, blend_value))
+        complementary_per_region_fraction = 1.0 - blend_value_clamped
         per_section_effective_region_weights_list.append(
-            section_descriptor["global_text_weight"] * per_section_strength_value
+            float(section_descriptor.get("enhanced_text_weight", 1.0))
+            * complementary_per_region_fraction
+            * per_section_strength_value
         )
 
     if not per_section_target_masks_list:
@@ -1177,6 +1265,18 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
             )
             required_inputs_dict[f"section_{section_index_for_declaration}_clip_g_strength"] = (
                 "FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05},
+            )
+            required_inputs_dict[
+                f"section_{section_index_for_declaration}_blend_enhanced_text_into_global_prompt"
+            ] = (
+                "FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "0 = enhanced text stays region-only (full cutoff isolation). "
+                        "1 = enhanced text fully visible in the natural prompt globally "
+                        "(no isolation). Intermediate values split between both."
+                    ),
+                },
             )
         return {
             "required": required_inputs_dict,

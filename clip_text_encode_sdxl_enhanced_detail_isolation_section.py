@@ -46,6 +46,17 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolationSection:
                     "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05,
                     "tooltip": "0 = exclude this section from the CLIP-G stream entirely.",
                 }),
+                "blend_enhanced_text_into_global_prompt": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": (
+                        "0 = enhanced text stays region-only (full cutoff isolation). "
+                        "1 = enhanced text fully visible in the natural prompt globally "
+                        "(no isolation; enhanced is just appended to the natural prompt). "
+                        "Intermediate values split between both — enhanced appears in the "
+                        "base prompt globally at weight (blend × enhanced_text_weight) AND "
+                        "drives the per-region overlay at weight ((1-blend) × enhanced_text_weight)."
+                    ),
+                }),
                 "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
                 "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
                 "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {
@@ -74,6 +85,7 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolationSection:
         enhanced_text_weight,
         clip_l_strength,
         clip_g_strength,
+        blend_enhanced_text_into_global_prompt,
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
@@ -88,6 +100,7 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolationSection:
             "enhanced_text_weight": float(enhanced_text_weight),
             "clip_l_strength": float(clip_l_strength),
             "clip_g_strength": float(clip_g_strength),
+            "blend_enhanced_text_into_global_prompt": float(blend_enhanced_text_into_global_prompt),
             "support_a1111_style_embedding_text": bool(support_a1111_style_embedding_text),
             "remove_text_for_unsupported_embeddings": bool(remove_text_for_unsupported_embeddings),
             "filter_known_a1111_embedding_tags_not_installed_locally": bool(
