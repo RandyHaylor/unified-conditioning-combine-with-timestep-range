@@ -166,44 +166,6 @@ function add_read_only_validation_status_widget_to_node_if_not_already_present(n
   validation_status_widget.options.serialize = false;
 }
 
-function insert_canvas_drawn_section_header_label_widget_just_before_named_widget(
-  node, name_of_widget_to_insert_header_above, header_display_text
-) {
-  if (!node.widgets || node.widgets.length === 0) return;
-  // Already inserted on a prior nodeCreated call? Skip.
-  const header_widget_unique_name = `__section_header_label_above_${name_of_widget_to_insert_header_above}`;
-  const already_present = node.widgets.some(function (w) {
-    return w && w.name === header_widget_unique_name;
-  });
-  if (already_present) return;
-  const target_widget_index_in_widgets_array = node.widgets.findIndex(function (w) {
-    return w && w.name === name_of_widget_to_insert_header_above;
-  });
-  if (target_widget_index_in_widgets_array < 0) return;
-  const section_header_label_widget = {
-    name: header_widget_unique_name,
-    type: "custom",
-    value: "",
-    options: { serialize: false },
-    draw(canvas_context, owning_node, widget_width_pixels, y_top_pixels, widget_height_pixels) {
-      canvas_context.save();
-      canvas_context.fillStyle = "#9aa";
-      canvas_context.font = "bold 11px Arial, sans-serif";
-      canvas_context.textBaseline = "middle";
-      canvas_context.fillText(
-        header_display_text,
-        12,
-        y_top_pixels + widget_height_pixels / 2
-      );
-      canvas_context.restore();
-    },
-    computeSize(available_widget_width_pixels) {
-      return [available_widget_width_pixels, 16];
-    },
-  };
-  node.widgets.splice(target_widget_index_in_widgets_array, 0, section_header_label_widget);
-}
-
 app.registerExtension({
   name: "UnifiedConditioningMerge.CutoffRealtimeValidator",
   async nodeCreated(node) {
@@ -211,13 +173,9 @@ app.registerExtension({
       return;
     }
 
-    // Visual grouping: drop a non-serializing "── zoom effect ──" header
-    // immediately above the zoom widget so users see the three zoom-effect
-    // widgets (zoom, offset_x, offset_y) as a labeled group instead of
-    // floating bare alongside the other globals.
-    insert_canvas_drawn_section_header_label_widget_just_before_named_widget(
-      node, "zoom", "── zoom effect ──"
-    );
+    // Zoom-effect header is injected by the OTHER frontend extension
+    // (web/clip_text_encode_with_cutoff_region_separation.js) which owns
+    // section headers and the zoom group header. We don't duplicate it here.
 
     add_read_only_validation_status_widget_to_node_if_not_already_present(node);
 

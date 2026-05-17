@@ -931,9 +931,8 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                 ),
             }),
             # Zoom-effect group (zoom + offset_x + offset_y). A canvas-drawn
-            # header label "── zoom effect ──" is inserted above these by
-            # the frontend extension (web/cutoff_realtime_validator.js's
-            # node-setup pass).
+            # header label is inserted above these by the dedicated frontend
+            # extension web/clip_text_encode_with_cutoff_region_separation.js.
             "zoom": ("FLOAT", {
                 "default": ZOOM_DEFAULT_VALUE,
                 "min": ZOOM_MINIMUM_VALUE,

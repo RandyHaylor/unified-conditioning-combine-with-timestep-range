@@ -26,7 +26,7 @@ const SECTION_HEADER_WIDGET_NAME_PREFIX = "__section_header_for_index_";
 const SECTION_HEADER_WIDGET_NAME_REGEX = /^__section_header_for_index_(\d+)$/;
 
 const ZOOM_GROUP_HEADER_WIDGET_NAME = "__zoom_group_header_static";
-const ZOOM_GROUP_HEADER_DISPLAY_LABEL_TEXT = "── zoom effect based on SDXL CLIP source, target image settings ──";
+const ZOOM_GROUP_HEADER_DISPLAY_LABEL_TEXT = "── zoom effect: based on SDXL CLIP source, target image settings ──";
 const ZOOM_WIDGET_NAME_TO_INSERT_HEADER_BEFORE = "zoom";
 
 const HIDDEN_WIDGET_TYPE_SENTINEL_PREFIX = "cutoffSectionsHidden:";
