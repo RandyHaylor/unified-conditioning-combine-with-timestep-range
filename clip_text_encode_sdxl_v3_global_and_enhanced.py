@@ -696,6 +696,47 @@ def _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
     )
 
 
+def _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
+    section_descriptor,
+):
+    """
+    Target derivation (v3 final design):
+
+      target words = (whitespace-split words in enhanced_text)
+                   MINUS (whitespace-split words in global_text)
+
+    The premise: enhanced_text is an EXPANDED version of global_text.
+    Words present in enhanced but NOT in global are the "added
+    descriptive enhancements" — they're the strong-bias content that
+    should be MASKED in other sections' encoding passes so they don't
+    contaminate other regions.
+
+    Match is case-insensitive. Each target word is returned in its
+    original case from enhanced_text (for downstream tokenization).
+    Order is enhanced_text declaration order (so subsequent token
+    lookups are deterministic). Duplicates collapsed.
+
+    Returns: list of unique target word strings.
+    """
+    global_text_lowercase_word_set = set(
+        word_lower for word_lower in (section_descriptor.get("global_text") or "").lower().split()
+    )
+    seen_lowercase_target_words_set = set()
+    target_words_in_original_case_in_declaration_order = []
+    for one_enhanced_word_original_case in (section_descriptor.get("enhanced_text") or "").split():
+        enhanced_word_stripped = one_enhanced_word_original_case.strip()
+        if not enhanced_word_stripped:
+            continue
+        enhanced_word_lowercase = enhanced_word_stripped.lower()
+        if enhanced_word_lowercase in global_text_lowercase_word_set:
+            continue
+        if enhanced_word_lowercase in seen_lowercase_target_words_set:
+            continue
+        seen_lowercase_target_words_set.add(enhanced_word_lowercase)
+        target_words_in_original_case_in_declaration_order.append(enhanced_word_stripped)
+    return target_words_in_original_case_in_declaration_order
+
+
 def _build_per_section_target_mask_over_content_positions_one_stream(
     section_descriptor,
     base_content_token_ids_flat_list,
@@ -709,19 +750,28 @@ def _build_per_section_target_mask_over_content_positions_one_stream(
     Cutoff-style target mask construction for a single section on a
     single stream.
 
-    For each space-separated word in section's global_text:
+    Target derivation: enhanced_text words MINUS global_text words
+    (case-insensitive set difference). See
+    `_compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global`.
+
+    For each derived target word:
       - tokenize it standalone via this stream's tokenizer
       - find ALL sublist matches within the base prompt's content tokens
       - mark those positions in the target mask
 
     Returns:
       (target_mask_one_dim_int_array_over_content_positions,
-       list_of_words_NOT_found_in_base_for_this_section_for_validator_warnings)
+       list_of_target_words_NOT_found_in_base_for_warnings)
     """
     target_mask_one_dim = np.zeros(expected_content_position_count_across_all_chunks, dtype=int)
-    words_not_found_in_base = []
-    for one_space_separated_global_word in section_descriptor["global_text"].split(" "):
-        word_stripped = one_space_separated_global_word.strip()
+    derived_target_words_in_original_case_list = (
+        _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
+            section_descriptor
+        )
+    )
+    target_words_not_found_in_base = []
+    for one_target_word_in_original_case in derived_target_words_in_original_case_list:
+        word_stripped = one_target_word_in_original_case.strip()
         if not word_stripped:
             continue
         # Tokenize standalone using this stream's per-stream tokenizer's
@@ -739,7 +789,7 @@ def _build_per_section_target_mask_over_content_positions_one_stream(
             base_content_token_ids_flat_list, word_content_ids
         )
         if not word_match_start_positions:
-            words_not_found_in_base.append(word_stripped)
+            target_words_not_found_in_base.append(word_stripped)
             continue
         word_length_in_tokens = len(word_content_ids)
         for one_match_start_position in word_match_start_positions:
@@ -747,7 +797,7 @@ def _build_per_section_target_mask_over_content_positions_one_stream(
             if one_match_end_exclusive > expected_content_position_count_across_all_chunks:
                 continue
             target_mask_one_dim[one_match_start_position : one_match_end_exclusive] = 1
-    return target_mask_one_dim, words_not_found_in_base
+    return target_mask_one_dim, target_words_not_found_in_base
 
 
 def _build_per_section_region_mask_over_content_positions_one_stream(

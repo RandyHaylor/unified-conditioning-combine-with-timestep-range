@@ -228,9 +228,19 @@ def _identify_missing_target_words_for_one_v3_section_global_in_enhanced(
     Returns a list of warning strings for this section. Empty list if
     nothing to warn about.
 
+    Premise: enhanced_text must be an EXPANDED version of global_text.
+    Every word in global_text should appear somewhere inside
+    enhanced_text. If a global word is MISSING from enhanced, the user
+    is signaling two incompatible texts — the cutoff math derives
+    targets as (enhanced_words - global_words), so a global word not
+    in enhanced doesn't change target derivation directly, but it does
+    indicate the user's mental model is off: global is supposed to be
+    the abbreviated form, enhanced the descriptive expansion.
+
     Rules:
       - If enhanced_text is empty OR equals global_text (case-insensitive,
         whitespace-normalized) → this section is a passthrough, no check.
+      - If global_text is empty → no check (no abbreviated form to compare).
       - Otherwise, split global_text on whitespace. For each word, verify
         it appears as a whole-word match (case-insensitive) inside
         enhanced_text. If not, emit a warning.
@@ -242,20 +252,19 @@ def _identify_missing_target_words_for_one_v3_section_global_in_enhanced(
     if normalized_enhanced_text_value.lower() == normalized_global_text_value.lower():
         return []
     if not normalized_global_text_value:
-        # Enhanced present, global empty — no targets to check.
         return []
     accumulated_warnings_for_this_section_list = []
-    for one_target_word_from_global in normalized_global_text_value.split():
-        if not one_target_word_from_global:
+    for one_global_word in normalized_global_text_value.split():
+        if not one_global_word:
             continue
         per_word_pattern = _build_per_word_boundary_regex_pattern_for_one_target_word(
-            one_target_word_from_global
+            one_global_word
         )
         if not per_word_pattern.search(normalized_enhanced_text_value):
             accumulated_warnings_for_this_section_list.append(
-                f"Section {section_one_based_index}: target word "
-                f"'{one_target_word_from_global}' not found in enhanced text — "
-                f"will have no isolation effect at that word's position."
+                f"Section {section_one_based_index}: global word "
+                f"'{one_global_word}' not found in enhanced text — "
+                f"enhanced should be an expanded version of global."
             )
     return accumulated_warnings_for_this_section_list
 
