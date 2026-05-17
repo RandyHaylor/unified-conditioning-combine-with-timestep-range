@@ -3,6 +3,7 @@ from .debug_conditioning import DebugConditioning
 from .clip_text_encode_sdxl_auto_split_and_merge import CLIPTextEncodeSDXLAutoSplitAndMerge
 from .conditioning_crop_zoom_sdxl import ConditioningCropZoomSDXL
 from .clip_text_encode_with_cutoff_region_separation import CLIPTextEncodeWithCutoffRegionSeparation
+from .clip_text_encode_sdxl_v2_with_isolation_amount import CLIPTextEncodeSDXLV2WithIsolationAmount
 
 # Side-effect import: registers HTTP routes used by the cutoff node's
 # realtime embedding-validation widget. Failure here should not block
@@ -24,6 +25,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPTextEncodeSDXLAutoSplitAndMerge": CLIPTextEncodeSDXLAutoSplitAndMerge,
     "ConditioningCropZoomSDXL": ConditioningCropZoomSDXL,
     "CLIPTextEncodeWithCutoffRegionSeparation": CLIPTextEncodeWithCutoffRegionSeparation,
+    "CLIPTextEncodeSDXLV2WithIsolationAmount": CLIPTextEncodeSDXLV2WithIsolationAmount,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -32,6 +34,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPTextEncodeSDXLAutoSplitAndMerge": "CLIPTextEncodeSDXL (auto-split-and-merge)",
     "ConditioningCropZoomSDXL": "Conditioning-crop-zoom-SDXL",
     "CLIPTextEncodeWithCutoffRegionSeparation": "CLIP Text Encode SDXL (Cutoff Region Enhanced)",
+    "CLIPTextEncodeSDXLV2WithIsolationAmount": "CLIP Text Encode SDXL v2 (Isolation Amount)",
 }
 
 WEB_DIRECTORY = "./web"
