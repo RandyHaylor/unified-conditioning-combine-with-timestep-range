@@ -329,6 +329,75 @@ def _pad_per_stream_tokenization_to_match_chunk_count(
     return embedding_tensor_for_short_stream
 
 
+EMBEDDING_REFERENCE_IN_PROMPT_TEXT_REGEX_PATTERN = re.compile(r"embedding:([\w./\\-]+)")
+
+# Per-stream expected embedding-vector dim for SDXL CLIP. Non-SDXL conditioning
+# (e.g., SD1.5 with only an "l" stream of 768) is handled by the per-stream
+# check: an extra "g" stream simply won't be present in the tokens dict.
+EXPECTED_EMBEDDING_DIM_PER_STREAM_KEY_FOR_SDXL = {
+    "l": 768,
+    "g": 1280,
+}
+
+
+def _warn_about_each_mismatched_shape_embedding_reference_in_prompt_text(prompt_text_string, clip_object):
+    """
+    Scans the prompt text for `embedding:NAME` references. For each one,
+    tokenizes it in isolation and inspects the resulting tokens for each
+    CLIP stream. If the embedding's loaded tensor has a last-dim that does
+    not match the stream's expected embedding dim, prints a warning naming
+    the embedding and the actual vs expected dims so the user knows which
+    embedding was the mismatched one.
+
+    This is informational only — we do NOT modify or skip the encode. The
+    stock encoder downstream will ignore mismatched embeddings (replacing
+    them with empty/PAD tokens) and emit its own short warning; this helper
+    just gives the user the FILE NAME (which stock's warning omits).
+    """
+    if not prompt_text_string:
+        return
+    embedding_names_already_warned_for_per_stream = set()
+    for embedding_reference_match in EMBEDDING_REFERENCE_IN_PROMPT_TEXT_REGEX_PATTERN.finditer(prompt_text_string):
+        embedding_name_from_prompt = embedding_reference_match.group(1)
+        try:
+            isolated_tokenization_for_this_one_embedding = clip_object.tokenize(
+                f"embedding:{embedding_name_from_prompt}"
+            )
+        except Exception:
+            continue
+        for stream_key, expected_dim in EXPECTED_EMBEDDING_DIM_PER_STREAM_KEY_FOR_SDXL.items():
+            chunks_list_for_this_stream = isolated_tokenization_for_this_one_embedding.get(stream_key)
+            if not chunks_list_for_this_stream:
+                continue
+            mismatch_already_detected_for_this_stream_for_this_embedding = False
+            for one_chunk_of_token_weight_pairs in chunks_list_for_this_stream:
+                if mismatch_already_detected_for_this_stream_for_this_embedding:
+                    break
+                for token_id_or_embedding_tensor, _weight in one_chunk_of_token_weight_pairs:
+                    if isinstance(token_id_or_embedding_tensor, torch.Tensor):
+                        actual_last_dim_of_embedding_tensor = token_id_or_embedding_tensor.shape[-1]
+                        if actual_last_dim_of_embedding_tensor != expected_dim:
+                            dedup_key_for_this_specific_warning = (
+                                embedding_name_from_prompt,
+                                stream_key,
+                                actual_last_dim_of_embedding_tensor,
+                                expected_dim,
+                            )
+                            if dedup_key_for_this_specific_warning not in embedding_names_already_warned_for_per_stream:
+                                logging.warning(
+                                    f"Warning: '{embedding_name_from_prompt}' embedding mismatch detected "
+                                    f"on CLIP-{stream_key.upper()} stream "
+                                    f"(got dim {actual_last_dim_of_embedding_tensor}, "
+                                    f"model expects dim {expected_dim}). "
+                                    f"Embedding may be designed for another model. "
+                                    f"The stock encoder will ignore it (drop + pad with empty tokens). "
+                                    f"Results may be unexpected."
+                                )
+                                embedding_names_already_warned_for_per_stream.add(dedup_key_for_this_specific_warning)
+                            mismatch_already_detected_for_this_stream_for_this_embedding = True
+                            break
+
+
 def _encode_one_group_via_plain_stock_clip_without_any_isolation(
     clip_object,
     section_descriptors_in_group_list,
@@ -391,6 +460,12 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     """
     group_full_prompt_text_for_isolate_streams = _build_full_prompt_text_for_one_group_of_sections(
         section_descriptors_in_group_list, join_separator_string
+    )
+    # Pre-scan for embedding files whose dim doesn't match this model's
+    # streams, so the user sees the FILE NAME of the offending embedding
+    # (stock's own warning only prints dims, not the name).
+    _warn_about_each_mismatched_shape_embedding_reference_in_prompt_text(
+        group_full_prompt_text_for_isolate_streams, clip_object
     )
     isolate_target_text_and_weight_pairs_for_this_group = _build_isolate_target_text_and_weight_pairs_for_one_group(
         section_descriptors_in_group_list
