@@ -611,30 +611,33 @@ _EMBEDDING_REFERENCE_AS_A_COMMA_PART_REGEX_PATTERN = re.compile(
 def _detect_whether_any_stream_has_a_shape_mismatched_tensor_for_this_embedding(
     embedding_name_string, clip_object
 ):
-    """Tokenizes `embedding:NAME` in isolation and checks per stream whether
+    """
+    Tokenizes `embedding:NAME` in isolation and checks per stream whether
     the loaded embedding tensor's last dim matches that stream's expected
-    embedding_size. Returns True if ANY stream mismatches."""
+    embedding_size. Returns True if ANY stream mismatches.
+
+    Bugfix history: an earlier implementation tried to look up the per-
+    stream tokenizer via getattr(clip.tokenizer, stream_key) where
+    stream_key was 'l' or 'g'. SDXLTokenizer exposes its sub-tokenizers
+    as `clip_l` and `clip_g`, so that getattr returned None and the
+    expected_dim fell through to None, the check was skipped, and the
+    function always returned False — leaving the unsupported-strip path
+    a no-op. Now uses the SDXL-hardcoded dim map for consistency with
+    the named-warning helper that already does the same.
+    """
     try:
         isolated_tokenization_per_stream = clip_object.tokenize(f"embedding:{embedding_name_string}")
     except Exception:
         return False
     if not isinstance(isolated_tokenization_per_stream, dict):
         return False
-    top_level_tokenizer_object_or_none = getattr(clip_object, "tokenizer", None)
-    for stream_name_key, chunks_list_for_this_stream in isolated_tokenization_per_stream.items():
+    for stream_name_key, expected_hidden_dim_for_this_stream in EXPECTED_EMBEDDING_DIM_PER_STREAM_KEY_FOR_SDXL.items():
+        chunks_list_for_this_stream = isolated_tokenization_per_stream.get(stream_name_key)
         if not isinstance(chunks_list_for_this_stream, list):
             continue
-        per_stream_tokenizer_object_or_none = (
-            getattr(top_level_tokenizer_object_or_none, stream_name_key, None)
-            if top_level_tokenizer_object_or_none is not None
-            else None
-        )
-        expected_hidden_dim_for_this_stream = getattr(
-            per_stream_tokenizer_object_or_none, "embedding_size", None
-        )
-        if expected_hidden_dim_for_this_stream is None:
-            continue
         for one_chunk_of_token_weight_pairs in chunks_list_for_this_stream:
+            if not isinstance(one_chunk_of_token_weight_pairs, list):
+                continue
             for token_id_or_embedding_tensor, _weight in one_chunk_of_token_weight_pairs:
                 if isinstance(token_id_or_embedding_tensor, torch.Tensor):
                     if token_id_or_embedding_tensor.shape[-1] != expected_hidden_dim_for_this_stream:
