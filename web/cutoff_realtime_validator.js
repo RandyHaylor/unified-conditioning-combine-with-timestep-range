@@ -23,6 +23,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
 
+// Set of node type names this validator widget attaches to. Both v1 and v3
+// use the same `section_N_*_text` widget naming convention (v1 has just
+// `_text`; v3 has `_global_text` and `_enhanced_text`) and both want the
+// realtime embedding-issue validator widget at the bottom of the node.
+const NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS = new Set([
+  "CLIPTextEncodeWithCutoffRegionSeparation",
+  "CLIPTextEncodeSDXLV3GlobalAndEnhanced",
+]);
 const NODE_TYPE_NAME_THIS_EXTENSION_TARGETS = "CLIPTextEncodeWithCutoffRegionSeparation";
 const VALIDATION_STATUS_READ_ONLY_WIDGET_NAME = "validation_status";
 const KEYSTROKE_DEBOUNCE_DELAY_MILLISECONDS = 400;
@@ -169,7 +177,7 @@ function add_read_only_validation_status_widget_to_node_if_not_already_present(n
 app.registerExtension({
   name: "UnifiedConditioningMerge.CutoffRealtimeValidator",
   async nodeCreated(node) {
-    if (!node || !node.constructor || node.constructor.type !== NODE_TYPE_NAME_THIS_EXTENSION_TARGETS) {
+    if (!node || !node.constructor || !NODE_TYPE_NAMES_THIS_EXTENSION_TARGETS.has(node.constructor.type)) {
       return;
     }
 
