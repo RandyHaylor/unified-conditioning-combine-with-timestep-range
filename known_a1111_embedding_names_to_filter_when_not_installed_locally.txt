@@ -1,0 +1,21 @@
+# Known A1111-style embedding names commonly found in shared prompts.
+#
+# When the cutoff node's `filter_known_a1111_embedding_tags_not_installed_locally`
+# toggle is ON (default), any bare comma-separated tag in a prompt that
+# matches a name in this list AND is NOT installed in the user's
+# ComfyUI embeddings directory is silently removed from the prompt before
+# tokenization. This prevents other people's shared A1111 prompts from
+# accidentally encoding an orphan embedding name as plain text and
+# nudging the image in an unintended direction.
+#
+# Lines starting with `#` and blank lines are ignored. Match is
+# case-insensitive on the bare name (no folder path).
+#
+# Maintainers: grow this list by running
+#   dev_tools/extract_embedding_names_from_prompt_corpus.py
+# against folders of community workflows / prompts and merging into
+# this file.
+bad-hands-5
+badhandv4
+civitai
+cr1sp

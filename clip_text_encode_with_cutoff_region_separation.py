@@ -334,6 +334,99 @@ def _pad_per_stream_tokenization_to_match_chunk_count(
 
 EMBEDDING_REFERENCE_IN_PROMPT_TEXT_REGEX_PATTERN = re.compile(r"embedding:([\w./\\-]+)")
 
+KNOWN_A1111_EMBEDDING_NAMES_LIST_FILE_RELATIVE_PATH_FROM_THIS_MODULE = (
+    "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
+)
+
+_cached_lowercase_set_of_known_a1111_embedding_names_to_filter = None
+
+
+def _load_known_a1111_embedding_names_to_filter_into_lowercase_set_from_text_file(
+    text_file_absolute_path,
+):
+    loaded_lowercase_names_set = set()
+    try:
+        with open(text_file_absolute_path, "r", encoding="utf-8") as opened_text_file_handle:
+            for one_line_in_file in opened_text_file_handle:
+                stripped_line_text = one_line_in_file.strip()
+                if not stripped_line_text or stripped_line_text.startswith("#"):
+                    continue
+                loaded_lowercase_names_set.add(stripped_line_text.lower())
+    except OSError:
+        pass
+    return loaded_lowercase_names_set
+
+
+def _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set():
+    global _cached_lowercase_set_of_known_a1111_embedding_names_to_filter
+    if _cached_lowercase_set_of_known_a1111_embedding_names_to_filter is None:
+        this_module_directory_absolute_path = os.path.dirname(os.path.abspath(__file__))
+        names_list_file_absolute_path = os.path.join(
+            this_module_directory_absolute_path,
+            KNOWN_A1111_EMBEDDING_NAMES_LIST_FILE_RELATIVE_PATH_FROM_THIS_MODULE,
+        )
+        _cached_lowercase_set_of_known_a1111_embedding_names_to_filter = (
+            _load_known_a1111_embedding_names_to_filter_into_lowercase_set_from_text_file(
+                names_list_file_absolute_path
+            )
+        )
+        logging.info(
+            f"unified-conditioning-merge: loaded "
+            f"{len(_cached_lowercase_set_of_known_a1111_embedding_names_to_filter)} known A1111 "
+            f"embedding name(s) from {names_list_file_absolute_path}"
+        )
+    return _cached_lowercase_set_of_known_a1111_embedding_names_to_filter
+
+
+def _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
+    prompt_text_string, available_embedding_lowercase_stem_to_filenames_map
+):
+    """
+    Walks comma-separated tags. For each bare tag (not already
+    `embedding:...`) that matches a name in the known-A1111-embedding-names
+    list (loaded from known_a1111_embedding_names_to_filter_when_not_installed_locally.txt)
+    AND does NOT correspond to a file installed in the user's embeddings
+    folder, drops the tag from the prompt entirely. Logs each removal.
+    """
+    if not prompt_text_string:
+        return prompt_text_string
+
+    known_a1111_embedding_names_lowercase_set = (
+        _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set()
+    )
+    if not known_a1111_embedding_names_lowercase_set:
+        return prompt_text_string
+
+    surviving_comma_separated_parts_list = []
+    for raw_comma_separated_part_text in prompt_text_string.split(","):
+        stripped_part_text = raw_comma_separated_part_text.strip()
+        if not stripped_part_text:
+            continue
+        # Skip explicit embedding: refs — those are handled by other passes.
+        if stripped_part_text.lower().startswith("embedding:"):
+            surviving_comma_separated_parts_list.append(raw_comma_separated_part_text)
+            continue
+        # Unwrap optional `(tag:weight)` paren wrapping for matching purposes.
+        bare_tag_text_for_matching = stripped_part_text
+        if bare_tag_text_for_matching.startswith("(") and bare_tag_text_for_matching.endswith(")"):
+            bare_tag_text_for_matching = bare_tag_text_for_matching[1:-1].strip()
+            if ":" in bare_tag_text_for_matching:
+                bare_tag_text_for_matching = bare_tag_text_for_matching.rsplit(":", 1)[0].strip()
+        if bare_tag_text_for_matching.lower() not in known_a1111_embedding_names_lowercase_set:
+            surviving_comma_separated_parts_list.append(raw_comma_separated_part_text)
+            continue
+        if bare_tag_text_for_matching.lower() in available_embedding_lowercase_stem_to_filenames_map:
+            # Tag matches known name AND is installed locally — let it through;
+            # the A1111-rewrite pass will turn it into a proper embedding ref.
+            surviving_comma_separated_parts_list.append(raw_comma_separated_part_text)
+            continue
+        logging.info(
+            f"Removed orphan A1111-style embedding tag '{bare_tag_text_for_matching}' from prompt "
+            f"(matches known-embedding-names list but not installed locally; "
+            f"filter_known_a1111_embedding_tags_not_installed_locally is enabled)."
+        )
+    return ", ".join(part.strip() for part in surviving_comma_separated_parts_list if part.strip())
+
 A1111_STYLE_OPTIONAL_WEIGHT_PARENTHESIZED_TAG_REGEX_PATTERN = re.compile(
     r"^\(\s*([^():,]+?)\s*(?::\s*([0-9.]+)\s*)?\)$"
 )
@@ -643,6 +736,7 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     start_from_masked_value,
     support_a1111_style_embedding_text_setting=True,
     remove_text_for_unsupported_embeddings_setting=True,
+    filter_known_a1111_embedding_tags_not_installed_locally_setting=True,
 ):
     """
     Returns a single CONDITIONING entry [combined_tokens_tensor, metadata_dict]
@@ -653,6 +747,24 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     group_full_prompt_text_for_isolate_streams = _build_full_prompt_text_for_one_group_of_sections(
         section_descriptors_in_group_list, join_separator_string
     )
+    # Orphan-embedding-tag filter: drop bare comma-separated tags that
+    # match the curated known-A1111-embedding-names list (loaded from
+    # known_a1111_embedding_names_to_filter_when_not_installed_locally.txt)
+    # but are NOT installed in the user's embeddings directory. This
+    # prevents other people's shared A1111 prompts (where bare tags like
+    # `bad-hands-5` reference embedding files the current user doesn't
+    # have) from being encoded as plain text and accidentally influencing
+    # the image.
+    if filter_known_a1111_embedding_tags_not_installed_locally_setting:
+        available_embedding_lowercase_stem_to_filenames_map = (
+            _build_lookup_of_available_embedding_stems_to_their_filename_list()
+        )
+        group_full_prompt_text_for_isolate_streams = (
+            _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
+                group_full_prompt_text_for_isolate_streams,
+                available_embedding_lowercase_stem_to_filenames_map,
+            )
+        )
     # A1111-style sweep: identify bare tags that exactly match an embedding
     # filename stem (case-insensitive) and rewrite them to ComfyUI's
     # `embedding:NAME` form so the tokenizer loads them. Logs each rewrite
@@ -828,6 +940,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
             }),
             "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
             "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
+            "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {"default": True}),
         }
         for section_index_for_declaration in range(1, MAX_SECTION_COUNT_SUPPORTED + 1):
             required_inputs_dict[f"section_{section_index_for_declaration}_text"] = (
@@ -869,6 +982,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
         offset_y,
         support_a1111_style_embedding_text=True,
         remove_text_for_unsupported_embeddings=True,
+        filter_known_a1111_embedding_tags_not_installed_locally=True,
         latent=None,
         **kwargs_for_individual_section_widget_values,
     ):
@@ -939,6 +1053,7 @@ class CLIPTextEncodeWithCutoffRegionSeparation:
                     mask_token, float(strict_mask), float(start_from_masked),
                     support_a1111_style_embedding_text_setting=bool(support_a1111_style_embedding_text),
                     remove_text_for_unsupported_embeddings_setting=bool(remove_text_for_unsupported_embeddings),
+                    filter_known_a1111_embedding_tags_not_installed_locally_setting=bool(filter_known_a1111_embedding_tags_not_installed_locally),
                 )
                 raw_conditioning_entries_collected_across_all_groups.append(empty_conditioning_entry)
             except Exception as encoding_failure_for_empty_prompt:
