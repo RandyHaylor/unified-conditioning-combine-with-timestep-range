@@ -38,7 +38,101 @@ from .cutoff_per_stream_isolation import (
     _flatten_chunked_token_weight_pairs_into_content_token_ids_skipping_start_end_pad,
     _find_all_sublist_match_start_positions_within_superlist,
 )
-# (No crop/zoom constants needed for v2; SDXL geometry comes from widget values directly.)
+
+# Shared feature helpers ported from v1 (clip_text_encode_with_cutoff_region_separation.py)
+# — A1111-style embedding rewriting, unsupported-embedding stripping, orphan-tag
+# filter, shape-mismatch warnings, SDXL zoom/crop metadata builder, latent W/H
+# resolver, and the upscaled-conditioning multiplier constants.
+from .clip_text_encode_with_cutoff_region_separation import (
+    _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form,
+    _strip_unsupported_embedding_references_from_prompt_text,
+    _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally,
+    _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set,
+    _build_lookup_of_available_embedding_stems_to_their_filename_list,
+    _emit_stock_style_shape_mismatch_warning_for_each_embedding_in_text_that_will_not_match_its_clip_stream_dim,
+    _compute_sdxl_size_and_crop_metadata_fields,
+    _resolve_target_image_width_and_height_from_optional_latent_or_defaults,
+    _clamp_numeric_value_inclusive,
+    UPSCALED_CONDITIONING_MULTIPLIER_DEFAULT_VALUE,
+    UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
+    ZOOM_DEFAULT_VALUE,
+    ZOOM_MINIMUM_VALUE,
+    ZOOM_MAXIMUM_VALUE,
+    OFFSET_DEFAULT_VALUE,
+    OFFSET_MINIMUM_VALUE,
+    OFFSET_MAXIMUM_VALUE,
+)
+
+
+def _parse_custom_embedding_names_string_into_lowercase_set(custom_names_input_text_string):
+    """
+    Parse the v2 node's `custom_embedding_names_to_strip` widget value into a
+    lowercase set, mirroring the same-named helper in v1's cutoff module.
+    Lines and/or comma-separated names; '#' lines are comments.
+    """
+    parsed_lowercase_names_set = set()
+    if not custom_names_input_text_string:
+        return parsed_lowercase_names_set
+    for one_raw_line in custom_names_input_text_string.splitlines():
+        stripped_line_text = one_raw_line.strip()
+        if not stripped_line_text or stripped_line_text.startswith("#"):
+            continue
+        for one_comma_separated_name in stripped_line_text.split(","):
+            stripped_name = one_comma_separated_name.strip()
+            if stripped_name:
+                parsed_lowercase_names_set.add(stripped_name.lower())
+    return parsed_lowercase_names_set
+
+
+def _apply_v1_style_prompt_text_transforms_to_one_region_text(
+    region_text_string,
+    clip_object,
+    support_a1111_style_embedding_text_setting,
+    remove_text_for_unsupported_embeddings_setting,
+    filter_known_a1111_embedding_tags_not_installed_locally_setting,
+    custom_embedding_names_to_strip_setting,
+):
+    """
+    Applies the same pre-encode text transforms v1 runs on each group's
+    prompt text, but to a single region's text in isolation. Order matches
+    v1:
+      1. Orphan-A1111-tag filter (drops uninstalled bare-name tags that
+         appear in the curated + custom names list).
+      2. A1111-style bare-tag rewrite (installed-locally bare tags →
+         `embedding:NAME`).
+      3. Unsupported-embedding text strip (drops `embedding:NAME` refs
+         whose tensor doesn't fit any CLIP stream's expected dim).
+      4. Shape-mismatch warning logging (does not mutate text).
+    """
+    working_text = region_text_string or ""
+    if filter_known_a1111_embedding_tags_not_installed_locally_setting:
+        available_embedding_lowercase_stem_to_filenames_map = (
+            _build_lookup_of_available_embedding_stems_to_their_filename_list()
+        )
+        custom_additional_names_lowercase_set = (
+            _parse_custom_embedding_names_string_into_lowercase_set(
+                custom_embedding_names_to_strip_setting
+            )
+        )
+        working_text = (
+            _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
+                working_text,
+                available_embedding_lowercase_stem_to_filenames_map,
+                additional_custom_names_lowercase_set=custom_additional_names_lowercase_set,
+            )
+        )
+    if support_a1111_style_embedding_text_setting:
+        working_text = _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form(
+            working_text
+        )
+    if remove_text_for_unsupported_embeddings_setting:
+        working_text = _strip_unsupported_embedding_references_from_prompt_text(
+            working_text, clip_object
+        )
+    _emit_stock_style_shape_mismatch_warning_for_each_embedding_in_text_that_will_not_match_its_clip_stream_dim(
+        clip_object, working_text
+    )
+    return working_text
 
 
 # Constants
@@ -479,18 +573,52 @@ class CLIPTextEncodeSDXLV2WithIsolationAmount:
     def INPUT_TYPES(cls):
         required_inputs_dict = {
             "clip": ("CLIP",),
+            "upscaled_conditioning_multiplier": ("FLOAT", {
+                "default": UPSCALED_CONDITIONING_MULTIPLIER_DEFAULT_VALUE,
+                "min": UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
+                "step": 0.01,
+            }),
             "region_count": ("INT", {
                 "default": DEFAULT_REGION_COUNT_VALUE,
                 "min": 0,
                 "max": MAX_REGION_COUNT_SUPPORTED,
                 "step": 1,
             }),
-            "width": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION}),
-            "height": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION}),
-            "crop_w": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION}),
-            "crop_h": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION}),
-            "target_width": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION}),
-            "target_height": ("INT", {"default": 1024, "min": 0, "max": nodes.MAX_RESOLUTION}),
+            "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
+            "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
+            "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {
+                "default": True,
+                "tooltip": (
+                    "List can be modified in custom node folder: "
+                    "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
+                ),
+            }),
+            "custom_embedding_names_to_strip": ("STRING", {
+                "multiline": True,
+                "default": "",
+                "placeholder": "One name per line (or comma-separated). Added to the file-based known-names filter.",
+            }),
+            # Zoom-effect group (zoom + offset_x + offset_y). A canvas-drawn
+            # header label is inserted above these by the v2 frontend
+            # extension web/clip_text_encode_sdxl_v2_with_isolation_amount.js.
+            "zoom": ("FLOAT", {
+                "default": ZOOM_DEFAULT_VALUE,
+                "min": ZOOM_MINIMUM_VALUE,
+                "max": ZOOM_MAXIMUM_VALUE,
+                "step": 0.01,
+            }),
+            "offset_x": ("FLOAT", {
+                "default": OFFSET_DEFAULT_VALUE,
+                "min": OFFSET_MINIMUM_VALUE,
+                "max": OFFSET_MAXIMUM_VALUE,
+                "step": 0.01,
+            }),
+            "offset_y": ("FLOAT", {
+                "default": OFFSET_DEFAULT_VALUE,
+                "min": OFFSET_MINIMUM_VALUE,
+                "max": OFFSET_MAXIMUM_VALUE,
+                "step": 0.01,
+            }),
         }
         for one_based_region_index_for_declaration in range(1, MAX_REGION_COUNT_SUPPORTED + 1):
             required_inputs_dict[f"region_{one_based_region_index_for_declaration}_text"] = (
@@ -513,23 +641,31 @@ class CLIPTextEncodeSDXLV2WithIsolationAmount:
             ] = (
                 "FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.05},
             )
-        return {"required": required_inputs_dict}
+        return {
+            "required": required_inputs_dict,
+            "optional": {
+                "latent": ("LATENT",),
+            },
+        }
 
-    RETURN_TYPES = ("CONDITIONING",)
-    RETURN_NAMES = ("conditioning",)
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("conditioning", "upscaled_conditioning", "reference_full_prompt")
     FUNCTION = "encode_v2"
     CATEGORY = "unified-conditioning-merge"
 
     def encode_v2(
         self,
         clip,
+        upscaled_conditioning_multiplier,
         region_count,
-        width,
-        height,
-        crop_w,
-        crop_h,
-        target_width,
-        target_height,
+        support_a1111_style_embedding_text,
+        remove_text_for_unsupported_embeddings,
+        filter_known_a1111_embedding_tags_not_installed_locally,
+        custom_embedding_names_to_strip,
+        zoom,
+        offset_x,
+        offset_y,
+        latent=None,
         **kwargs_with_per_region_widget_values,
     ):
         active_region_descriptors_list = (
@@ -538,20 +674,73 @@ class CLIPTextEncodeSDXLV2WithIsolationAmount:
             )
         )
 
+        # Apply v1's per-prompt text transforms to each active region BEFORE
+        # any encoding work. Each region is treated as an independent prompt
+        # text for transform purposes: orphan-A1111-tag filter, A1111 bare-tag
+        # rewrite, unsupported-embedding strip, shape-mismatch warning logging.
+        for region_descriptor_to_mutate in active_region_descriptors_list:
+            region_descriptor_to_mutate["text"] = (
+                _apply_v1_style_prompt_text_transforms_to_one_region_text(
+                    region_descriptor_to_mutate["text"],
+                    clip,
+                    bool(support_a1111_style_embedding_text),
+                    bool(remove_text_for_unsupported_embeddings),
+                    bool(filter_known_a1111_embedding_tags_not_installed_locally),
+                    str(custom_embedding_names_to_strip or ""),
+                )
+            )
+        # Some regions may now have empty text (entire body was stripped); drop them.
+        active_region_descriptors_list = [
+            R for R in active_region_descriptors_list if (R["text"] or "").strip()
+        ]
+
+        # Resolve SDXL geometry: target W/H from latent if provided, else 1024².
+        # Build both primary and (multiplied) upscaled metadata dicts.
+        primary_target_image_width, primary_target_image_height = (
+            _resolve_target_image_width_and_height_from_optional_latent_or_defaults(latent)
+        )
+        conditioning_upscale_factor_clamped = max(
+            UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
+            float(upscaled_conditioning_multiplier),
+        )
+        upscaled_target_image_width = int(round(primary_target_image_width * conditioning_upscale_factor_clamped))
+        upscaled_target_image_height = int(round(primary_target_image_height * conditioning_upscale_factor_clamped))
+
+        zoom_factor_clamped = max(ZOOM_MINIMUM_VALUE, float(zoom))
+        offset_x_clamped = _clamp_numeric_value_inclusive(
+            float(offset_x), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE
+        )
+        offset_y_clamped = _clamp_numeric_value_inclusive(
+            float(offset_y), OFFSET_MINIMUM_VALUE, OFFSET_MAXIMUM_VALUE
+        )
+        primary_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields(
+            primary_target_image_width, primary_target_image_height,
+            zoom_factor_clamped, offset_x_clamped, offset_y_clamped,
+        )
+        upscaled_targets_differ_from_primary = (
+            upscaled_target_image_width != primary_target_image_width
+            or upscaled_target_image_height != primary_target_image_height
+        )
+        if upscaled_targets_differ_from_primary:
+            upscaled_sdxl_size_and_crop_metadata_fields = _compute_sdxl_size_and_crop_metadata_fields(
+                upscaled_target_image_width, upscaled_target_image_height,
+                zoom_factor_clamped, offset_x_clamped, offset_y_clamped,
+            )
+        else:
+            upscaled_sdxl_size_and_crop_metadata_fields = primary_sdxl_size_and_crop_metadata_fields
+
         if not active_region_descriptors_list:
             # Encode empty prompt as fallback so the workflow can still run.
             empty_prompt_tokens = clip.tokenize("")
-            empty_cond_list = clip.encode_from_tokens_scheduled(
-                empty_prompt_tokens,
-                add_dict={
-                    "width": width, "height": height,
-                    "crop_w": crop_w, "crop_h": crop_h,
-                    "target_width": target_width, "target_height": target_height,
-                },
+            primary_empty_cond_list = clip.encode_from_tokens_scheduled(
+                empty_prompt_tokens, add_dict=primary_sdxl_size_and_crop_metadata_fields,
             )
-            return (empty_cond_list,)
+            upscaled_empty_cond_list = clip.encode_from_tokens_scheduled(
+                empty_prompt_tokens, add_dict=upscaled_sdxl_size_and_crop_metadata_fields,
+            )
+            return (primary_empty_cond_list, upscaled_empty_cond_list, "")
 
-        # Encode per stream independently
+        # Encode per stream independently with the v2 isolation-amount math.
         final_per_stream_embedding_tensor = {}
         final_per_stream_pooled_output_or_none = {}
         for stream_key in ("l", "g"):
@@ -577,15 +766,19 @@ class CLIPTextEncodeSDXLV2WithIsolationAmount:
             dim=-1,
         )
 
-        output_metadata_dict = {
-            "width": int(width),
-            "height": int(height),
-            "crop_w": int(crop_w),
-            "crop_h": int(crop_h),
-            "target_width": int(target_width),
-            "target_height": int(target_height),
-        }
+        # Build two CONDITIONING outputs sharing the token tensor but with
+        # distinct SDXL metadata (primary target W/H vs upscaled target W/H).
+        primary_metadata_dict = dict(primary_sdxl_size_and_crop_metadata_fields)
+        upscaled_metadata_dict = dict(upscaled_sdxl_size_and_crop_metadata_fields)
         if final_per_stream_pooled_output_or_none.get("g") is not None:
-            output_metadata_dict["pooled_output"] = final_per_stream_pooled_output_or_none["g"]
+            primary_metadata_dict["pooled_output"] = final_per_stream_pooled_output_or_none["g"]
+            upscaled_metadata_dict["pooled_output"] = final_per_stream_pooled_output_or_none["g"]
 
-        return ([[sdxl_combined_token_embedding_tensor, output_metadata_dict]],)
+        reference_full_prompt_text_for_output = ", ".join(
+            R["text"] for R in active_region_descriptors_list
+        )
+        return (
+            [[sdxl_combined_token_embedding_tensor, primary_metadata_dict]],
+            [[sdxl_combined_token_embedding_tensor, upscaled_metadata_dict]],
+            reference_full_prompt_text_for_output,
+        )
