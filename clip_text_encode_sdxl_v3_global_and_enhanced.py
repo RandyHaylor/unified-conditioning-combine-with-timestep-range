@@ -315,51 +315,25 @@ def _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set():
     return _cached_lowercase_set_of_known_a1111_embedding_names_to_filter
 
 
-def _parse_custom_embedding_names_string_into_lowercase_set(custom_names_input_text_string):
-    """
-    Parse the per-node `custom_embedding_names_to_strip` widget value into
-    a lowercase set of names. Accepts one-name-per-line and/or comma-
-    separated. Lines starting with `#` and blank lines are ignored.
-    """
-    parsed_lowercase_names_set = set()
-    if not custom_names_input_text_string:
-        return parsed_lowercase_names_set
-    for one_raw_line in custom_names_input_text_string.splitlines():
-        stripped_line_text = one_raw_line.strip()
-        if not stripped_line_text or stripped_line_text.startswith("#"):
-            continue
-        for one_comma_separated_name in stripped_line_text.split(","):
-            stripped_name = one_comma_separated_name.strip()
-            if stripped_name:
-                parsed_lowercase_names_set.add(stripped_name.lower())
-    return parsed_lowercase_names_set
-
-
 def _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
     prompt_text_string,
     available_embedding_lowercase_stem_to_filenames_map,
-    additional_custom_names_lowercase_set=None,
 ):
     """
     Walks comma-separated tags. For each bare tag (not already
-    `embedding:...`) that matches a name in the union of (the curated
-    known-A1111-embedding-names list loaded from
+    `embedding:...`) that matches a name in the curated
+    known-A1111-embedding-names list (loaded from
     known_a1111_embedding_names_to_filter_when_not_installed_locally.txt
-    + any additional names from the per-node custom-strip widget) AND
-    does NOT correspond to a file installed in the user's embeddings
-    folder, drops the tag from the prompt entirely. Logs each removal.
+    at the plugin root) AND does NOT correspond to a file installed
+    in the user's embeddings folder, drops the tag from the prompt
+    entirely. Logs each removal.
     """
     if not prompt_text_string:
         return prompt_text_string
 
-    file_known_names_lowercase_set = (
+    known_a1111_embedding_names_lowercase_set = (
         _get_cached_or_lazily_load_known_a1111_embedding_names_lowercase_set()
     )
-    union_of_known_names_to_filter_lowercase_set = (
-        file_known_names_lowercase_set
-        | (additional_custom_names_lowercase_set or set())
-    )
-    known_a1111_embedding_names_lowercase_set = union_of_known_names_to_filter_lowercase_set
     if not known_a1111_embedding_names_lowercase_set:
         return prompt_text_string
 
@@ -656,13 +630,16 @@ def _apply_v3_per_text_transforms_to_one_text_string(
     support_a1111_style_embedding_text_setting,
     remove_text_for_unsupported_embeddings_setting,
     filter_known_a1111_embedding_tags_not_installed_locally_setting,
-    custom_embedding_names_to_strip_lowercase_set,
 ):
     """
     Apply the same suite of text-transform passes v1 runs on each
     section's text (orphan-A1111-tag filter, A1111 bare-tag rewrite,
     shape-mismatch warning, unsupported-embedding strip), to a single
     text string in isolation. Same order v1 uses.
+
+    The orphan-tag filter reads its names list from the curated
+    text file `known_a1111_embedding_names_to_filter_when_not_installed_locally.txt`
+    at the plugin root — no per-node override.
     """
     working_text = raw_text_string or ""
     if not working_text.strip():
@@ -675,7 +652,6 @@ def _apply_v3_per_text_transforms_to_one_text_string(
             _strip_orphan_a1111_bare_tags_matching_known_names_list_but_not_installed_locally(
                 working_text,
                 available_embedding_lowercase_stem_to_filenames_map,
-                additional_custom_names_lowercase_set=custom_embedding_names_to_strip_lowercase_set,
             )
         )
     if support_a1111_style_embedding_text_setting:
@@ -1111,11 +1087,6 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
                     "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
                 ),
             }),
-            "custom_embedding_names_to_strip": ("STRING", {
-                "multiline": True,
-                "default": "",
-                "placeholder": "One name per line (or comma-separated). Added to the file-based known-names filter.",
-            }),
             # Zoom-effect group (zoom + offset_x + offset_y). A canvas-drawn
             # header label is inserted above these by the dedicated frontend
             # extension web/clip_text_encode_sdxl_v3_global_and_enhanced.js.
@@ -1177,7 +1148,6 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
-        custom_embedding_names_to_strip,
         zoom,
         offset_x,
         offset_y,
@@ -1192,13 +1162,10 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
 
         # Per-section text transforms — applied to BOTH global_text and
         # enhanced_text per section, in v1's order (orphan filter, A1111
-        # rewrite, shape-mismatch warnings, unsupported strip). After this
-        # the descriptors hold transformed text.
-        custom_embedding_names_to_strip_lowercase_set = (
-            _parse_custom_embedding_names_string_into_lowercase_set(
-                str(custom_embedding_names_to_strip or "")
-            )
-        )
+        # rewrite, shape-mismatch warnings, unsupported strip). The
+        # orphan filter uses the curated text-file-based list ONLY
+        # (file: known_a1111_embedding_names_to_filter_when_not_installed_locally.txt
+        # at the plugin root). No per-node custom override widget — matches v1.
         for section_descriptor_to_transform in active_section_descriptors_list:
             section_descriptor_to_transform["global_text"] = (
                 _apply_v3_per_text_transforms_to_one_text_string(
@@ -1207,7 +1174,6 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
                     bool(support_a1111_style_embedding_text),
                     bool(remove_text_for_unsupported_embeddings),
                     bool(filter_known_a1111_embedding_tags_not_installed_locally),
-                    custom_embedding_names_to_strip_lowercase_set,
                 )
             )
             section_descriptor_to_transform["enhanced_text"] = (
@@ -1217,7 +1183,6 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
                     bool(support_a1111_style_embedding_text),
                     bool(remove_text_for_unsupported_embeddings),
                     bool(filter_known_a1111_embedding_tags_not_installed_locally),
-                    custom_embedding_names_to_strip_lowercase_set,
                 )
             )
             # Re-evaluate true-region after text transforms (one or both
