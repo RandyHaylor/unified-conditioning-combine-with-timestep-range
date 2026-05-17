@@ -33,10 +33,13 @@ NO external plugin dependency. Self-contained.
 
 import inspect
 import logging
+import os
 import re
 import sys
 
 import torch
+
+import folder_paths
 
 from .cutoff_per_stream_isolation import encode_one_stream_with_cutoff_style_region_isolation
 
@@ -331,6 +334,113 @@ def _pad_per_stream_tokenization_to_match_chunk_count(
 
 EMBEDDING_REFERENCE_IN_PROMPT_TEXT_REGEX_PATTERN = re.compile(r"embedding:([\w./\\-]+)")
 
+A1111_STYLE_OPTIONAL_WEIGHT_PARENTHESIZED_TAG_REGEX_PATTERN = re.compile(
+    r"^\(\s*([^():,]+?)\s*(?::\s*([0-9.]+)\s*)?\)$"
+)
+
+
+def _build_lookup_of_available_embedding_stems_to_their_filename_list():
+    """
+    Returns {lowercased_stem: [filename, filename, ...]} mapping the basename-
+    without-extension of every file in ComfyUI's `embeddings` directory to the
+    full filename(s) that share that stem. Case-insensitive on the key side so
+    A1111-style tags (which are usually typed case-loose) can match.
+    """
+    try:
+        available_embedding_filenames_list = folder_paths.get_filename_list("embeddings")
+    except Exception:
+        return {}
+    lowercased_stem_to_filename_list_map = {}
+    for embedding_filename in available_embedding_filenames_list:
+        stem_without_extension = os.path.splitext(embedding_filename)[0]
+        lowercased_stem_to_filename_list_map.setdefault(stem_without_extension.lower(), []).append(
+            embedding_filename
+        )
+    return lowercased_stem_to_filename_list_map
+
+
+def _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form(prompt_text_string):
+    """
+    Scans the prompt's comma-separated tags. For each tag that EXACTLY matches
+    (case-insensitive) the stem of an available embedding file, rewrites it to
+    `embedding:STEM` so ComfyUI's tokenizer will load it. Supports the
+    `(tag:weight)` parenthesized-weight form too.
+
+    Logs:
+      - INFO line per identified tag: which embedding file was matched.
+      - WARNING line if the tag matches multiple available files (different
+        extensions of the same stem). The first file is used.
+
+    Returns the rewritten prompt text. If no rewrites apply, returns the
+    original text unchanged.
+    """
+    if not prompt_text_string:
+        return prompt_text_string
+
+    lowercased_stem_to_filename_list_map = _build_lookup_of_available_embedding_stems_to_their_filename_list()
+    if not lowercased_stem_to_filename_list_map:
+        return prompt_text_string
+
+    rewritten_comma_separated_parts = []
+    for raw_comma_separated_part_with_possible_surrounding_whitespace in prompt_text_string.split(","):
+        stripped_part = raw_comma_separated_part_with_possible_surrounding_whitespace.strip()
+        if not stripped_part:
+            rewritten_comma_separated_parts.append(raw_comma_separated_part_with_possible_surrounding_whitespace)
+            continue
+
+        # Strip a single layer of optional `(tag:weight)` parens so the bare
+        # tag inside can be matched. If matched, we reassemble with the same
+        # parens + weight after substitution.
+        bare_token_text_to_consider_for_matching = stripped_part
+        opening_paren_for_reassembly = ""
+        closing_paren_for_reassembly = ""
+        weight_suffix_for_reassembly = ""
+        parenthesized_form_match = A1111_STYLE_OPTIONAL_WEIGHT_PARENTHESIZED_TAG_REGEX_PATTERN.match(stripped_part)
+        if parenthesized_form_match is not None:
+            bare_token_text_to_consider_for_matching = parenthesized_form_match.group(1).strip()
+            opening_paren_for_reassembly = "("
+            closing_paren_for_reassembly = ")"
+            parsed_weight_string_or_none = parenthesized_form_match.group(2)
+            if parsed_weight_string_or_none is not None:
+                weight_suffix_for_reassembly = f":{parsed_weight_string_or_none}"
+
+        # If it already uses the embedding: prefix, leave it alone.
+        if bare_token_text_to_consider_for_matching.lower().startswith("embedding:"):
+            rewritten_comma_separated_parts.append(raw_comma_separated_part_with_possible_surrounding_whitespace)
+            continue
+
+        matching_filename_list_for_this_tag = lowercased_stem_to_filename_list_map.get(
+            bare_token_text_to_consider_for_matching.lower()
+        )
+        if not matching_filename_list_for_this_tag:
+            rewritten_comma_separated_parts.append(raw_comma_separated_part_with_possible_surrounding_whitespace)
+            continue
+
+        chosen_embedding_filename = matching_filename_list_for_this_tag[0]
+        chosen_embedding_filename_stem = os.path.splitext(chosen_embedding_filename)[0]
+
+        if len(matching_filename_list_for_this_tag) > 1:
+            logging.warning(
+                f"A1111-style embedding tag '{bare_token_text_to_consider_for_matching}' matches "
+                f"multiple files in the embeddings directory: {matching_filename_list_for_this_tag}. "
+                f"Using first found: '{chosen_embedding_filename}'."
+            )
+        logging.info(
+            f"A1111-style embedding tag detected: '{bare_token_text_to_consider_for_matching}' "
+            f"(no 'embedding:' prefix); rewriting to 'embedding:{chosen_embedding_filename_stem}' "
+            f"(matched file: '{chosen_embedding_filename}')."
+        )
+
+        rewritten_with_comfyui_prefix_form = (
+            f"{opening_paren_for_reassembly}"
+            f"embedding:{chosen_embedding_filename_stem}"
+            f"{weight_suffix_for_reassembly}"
+            f"{closing_paren_for_reassembly}"
+        )
+        rewritten_comma_separated_parts.append(rewritten_with_comfyui_prefix_form)
+
+    return ", ".join(part.strip() for part in rewritten_comma_separated_parts if part.strip())
+
 # Per-stream expected embedding-vector dim for SDXL CLIP. Non-SDXL conditioning
 # (e.g., SD1.5 with only an "l" stream of 768) is handled by the per-stream
 # check: an extra "g" stream simply won't be present in the tokens dict.
@@ -461,6 +571,15 @@ def _encode_one_group_into_one_sdxl_conditioning_entry(
     """
     group_full_prompt_text_for_isolate_streams = _build_full_prompt_text_for_one_group_of_sections(
         section_descriptors_in_group_list, join_separator_string
+    )
+    # A1111-style sweep: identify bare tags that exactly match an embedding
+    # filename stem (case-insensitive) and rewrite them to ComfyUI's
+    # `embedding:NAME` form so the tokenizer loads them. Logs each rewrite
+    # and warns when multiple files share the same stem.
+    group_full_prompt_text_for_isolate_streams = (
+        _rewrite_a1111_style_bare_embedding_tags_to_comfyui_embedding_prefix_form(
+            group_full_prompt_text_for_isolate_streams
+        )
     )
     # Pre-scan for embedding files whose dim doesn't match this model's
     # streams, so the user sees the FILE NAME of the offending embedding
