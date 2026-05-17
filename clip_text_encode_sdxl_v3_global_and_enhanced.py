@@ -792,11 +792,20 @@ def _build_per_section_target_mask_over_content_positions_one_stream(
        list_of_target_words_NOT_found_in_base_for_warnings)
     """
     target_mask_one_dim = np.zeros(expected_content_position_count_across_all_chunks, dtype=int)
-    derived_target_words_in_original_case_list = (
-        _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
-            section_descriptor
+    # Two paths for target derivation:
+    # (1) Explicit override list provided on the section descriptor —
+    #     used by inline-tagged callers (e.g., the InlineTagged node)
+    #     where DETAIL tags directly specify which words to mask.
+    # (2) Set difference of enhanced - global words (default v3 path).
+    override_target_words_or_none = section_descriptor.get("override_target_words_list")
+    if override_target_words_or_none is not None:
+        derived_target_words_in_original_case_list = list(override_target_words_or_none)
+    else:
+        derived_target_words_in_original_case_list = (
+            _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
+                section_descriptor
+            )
         )
-    )
     target_words_not_found_in_base = []
     for one_target_word_in_original_case in derived_target_words_in_original_case_list:
         word_stripped = one_target_word_in_original_case.strip()

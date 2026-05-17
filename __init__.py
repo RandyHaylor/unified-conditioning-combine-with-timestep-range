@@ -10,6 +10,9 @@ from .clip_text_encode_sdxl_enhanced_detail_isolation_section import (
 from .clip_text_encode_sdxl_enhanced_detail_isolation import (
     CLIPTextEncodeSDXLEnhancedDetailIsolation,
 )
+from .clip_text_encode_sdxl_enhanced_inline_tagged import (
+    CLIPTextEncodeSDXLEnhancedInlineTagged,
+)
 
 # Side-effect import: registers HTTP routes used by the cutoff node's
 # realtime embedding-validation widget. Failure here should not block
@@ -34,6 +37,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPTextEncodeSDXLV3GlobalAndEnhanced": CLIPTextEncodeSDXLV3GlobalAndEnhanced,
     "CLIPTextEncodeSDXLEnhancedDetailIsolation": CLIPTextEncodeSDXLEnhancedDetailIsolation,
     "CLIPTextEncodeSDXLEnhancedDetailIsolationSection": CLIPTextEncodeSDXLEnhancedDetailIsolationSection,
+    "CLIPTextEncodeSDXLEnhancedInlineTagged": CLIPTextEncodeSDXLEnhancedInlineTagged,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -45,6 +49,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPTextEncodeSDXLV3GlobalAndEnhanced": "CLIP Text Encode SDXL v3 (Global + Enhanced)",
     "CLIPTextEncodeSDXLEnhancedDetailIsolation": "CLIP Text Encode SDXL Enhanced (Detail Isolation)",
     "CLIPTextEncodeSDXLEnhancedDetailIsolationSection": "CLIP Text Encode SDXL Enhanced (Detail Isolation) Section",
+    "CLIPTextEncodeSDXLEnhancedInlineTagged": "CLIP Text Encode SDXL Enhanced (Inline Tags)",
 }
 
 WEB_DIRECTORY = "./web"
