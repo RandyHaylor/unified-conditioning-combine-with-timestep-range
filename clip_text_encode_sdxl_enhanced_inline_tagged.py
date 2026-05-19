@@ -137,6 +137,37 @@ DEFAULT_TIMESTEP_RANGE_START_VALUE = 0.0
 DEFAULT_TIMESTEP_RANGE_END_VALUE = 1.0
 FLOAT_EPSILON_FOR_TIMESTEP_BREAKPOINT_DEDUPE = 1e-9
 
+# Matches a run that contains at least one newline, plus any adjacent
+# commas/spaces/tabs/newlines on either side. Collapsed to a single
+# comma when the convert_newlines_to_commas setting is enabled.
+NEWLINE_RUN_WITH_ADJACENT_COMMA_AND_WHITESPACE_REGEX_PATTERN = re.compile(
+    r"[ \t,]*[\r\n]+[ \t,\r\n]*"
+)
+
+
+def _convert_newline_runs_to_single_commas_collapsing_adjacent_commas(raw_text_value_to_convert):
+    """
+    Converts any run of newlines (with any adjacent commas / spaces /
+    tabs) into a single comma. Examples:
+
+        "a\nb"        -> "a,b"
+        "a\n\n\nb"    -> "a,b"
+        "a,\n\n,b"    -> "a,b"
+        "a \n b"      -> "a,b"
+
+    Leading/trailing resulting commas are stripped so the text doesn't
+    start or end with a stray comma introduced purely by leading/
+    trailing newlines.
+    """
+    converted_text_value = NEWLINE_RUN_WITH_ADJACENT_COMMA_AND_WHITESPACE_REGEX_PATTERN.sub(
+        ",", raw_text_value_to_convert or ""
+    )
+    # Strip a leading/trailing comma (with optional spaces) introduced by
+    # leading/trailing newline runs.
+    converted_text_value = re.sub(r"^\s*,\s*", "", converted_text_value)
+    converted_text_value = re.sub(r"\s*,\s*$", "", converted_text_value)
+    return converted_text_value
+
 
 def _parse_optional_region_attributes_block_into_timestep_range_dict(attrs_block_text_inside_opening_tag):
     """
@@ -413,6 +444,16 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
                         "isolation effect against plain CLIP encoding of the same prompt."
                     ),
                 }),
+                "convert_newlines_to_commas": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": (
+                        "ON: any run of newlines (with adjacent commas/spaces/tabs) in the "
+                        "prompt collapses to a single comma before parsing. Lets you write "
+                        "each region/tag on its own line for readability and have them "
+                        "comma-joined automatically. OFF: newlines pass through as-is "
+                        "(CLIP treats them as whitespace)."
+                    ),
+                }),
                 "support_a1111_style_embedding_text": ("BOOLEAN", {"default": True}),
                 "remove_text_for_unsupported_embeddings": ("BOOLEAN", {"default": True}),
                 "filter_known_a1111_embedding_tags_not_installed_locally": ("BOOLEAN", {
@@ -467,6 +508,7 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         inline_tagged_prompt_text,
         upscaled_conditioning_multiplier,
         enable_region_detail_processing,
+        convert_newlines_to_commas,
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
@@ -477,6 +519,16 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         latent=None,
     ):
         raw_user_text_value = str(inline_tagged_prompt_text or "")
+        # Global preprocessing: collapse newline runs to single commas
+        # (with adjacent comma/space/tab absorption) when enabled. Runs
+        # before all parsing so it applies uniformly to passthrough text,
+        # region bodies, and the inter-region structure.
+        if bool(convert_newlines_to_commas):
+            raw_user_text_value = (
+                _convert_newline_runs_to_single_commas_collapsing_adjacent_commas(
+                    raw_user_text_value
+                )
+            )
         if not bool(enable_region_detail_processing):
             # A/B-test mode: strip ALL <REGION>...</REGION> and <DETAIL>...</DETAIL>
             # tags from the user's text and treat the result as a single
