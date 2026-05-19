@@ -279,6 +279,16 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
                         "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
                     ),
                 }),
+                "join_separator": ("STRING", {
+                    "default": ",",
+                    "multiline": False,
+                    "tooltip": (
+                        "String inserted between parsed sections in the base prompt "
+                        "when the prior section did not already end with this separator. "
+                        "Default ','. Empty = no separator inserted; single commas still "
+                        "preserved from any trailing punctuation the user typed in the section."
+                    ),
+                }),
                 "zoom": ("FLOAT", {
                     "default": ZOOM_DEFAULT_VALUE,
                     "min": ZOOM_MINIMUM_VALUE,
@@ -317,6 +327,7 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
+        join_separator,
         zoom,
         offset_x,
         offset_y,
@@ -435,10 +446,11 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
             )
             return (primary_empty_conditioning_list, upscaled_empty_conditioning_list, "")
 
+        join_separator_string_for_this_call = str(join_separator if join_separator is not None else ",")
         try:
             raw_conditioning_entry_from_shared_encoder = (
                 encode_active_v3_sections_into_one_sdxl_conditioning_entry(
-                    clip, parsed_section_descriptors_list
+                    clip, parsed_section_descriptors_list, join_separator_string_for_this_call
                 )
             )
         except Exception as encoding_failure_exception_caught:
@@ -465,7 +477,7 @@ class CLIPTextEncodeSDXLEnhancedInlineTagged:
 
         reference_plain_text_for_user_display = (
             build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
-                parsed_section_descriptors_list
+                parsed_section_descriptors_list, join_separator_string_for_this_call
             )
         )
 

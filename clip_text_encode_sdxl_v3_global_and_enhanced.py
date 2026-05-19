@@ -230,27 +230,57 @@ def _select_per_stream_strength_value_for_section(section_descriptor, stream_key
     return section_descriptor["clip_g_strength"]
 
 
+SECTION_LEADING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN = re.compile(r"^[ ,\t\n\r]+")
+SECTION_TRAILING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN = re.compile(r"[ ,\t\n\r]+$")
+
+
+def _strip_section_outer_punctuation_and_detect_leading_and_trailing_comma_flags(raw_text_for_one_section):
+    """
+    Per-section text normalization (5-step algorithm spec):
+
+      1. Detect leading run of [space/comma/tab/newline]+; record whether
+         it contained at least one comma (`had_leading_comma`).
+      2. Detect trailing run of the same; record `had_trailing_comma`.
+      3. Strip both runs.
+
+    Caller handles steps 4-6 (wrap, restore commas conditionally, append
+    join_separator). Section INTERIOR text is left untouched.
+    """
+    raw_text_value_or_empty = raw_text_for_one_section or ""
+    leading_match_or_none = SECTION_LEADING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN.search(
+        raw_text_value_or_empty
+    )
+    had_leading_comma_in_original = bool(leading_match_or_none) and ("," in leading_match_or_none.group(0))
+    trailing_match_or_none = SECTION_TRAILING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN.search(
+        raw_text_value_or_empty
+    )
+    had_trailing_comma_in_original = bool(trailing_match_or_none) and ("," in trailing_match_or_none.group(0))
+    text_with_leading_stripped = SECTION_LEADING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN.sub(
+        "", raw_text_value_or_empty
+    )
+    text_with_both_outer_stripped = SECTION_TRAILING_PUNCTUATION_AND_WHITESPACE_REGEX_PATTERN.sub(
+        "", text_with_leading_stripped
+    )
+    return (
+        text_with_both_outer_stripped,
+        had_leading_comma_in_original,
+        had_trailing_comma_in_original,
+    )
+
+
 def _build_per_section_base_prompt_fragment_list_for_one_stream(
     section_descriptor, stream_key_l_or_g
 ):
     """
-    Architecture (BNK-cutoff-faithful):
+    Builds this section's base-prompt contribution as a dict carrying:
+      - "wrapped_fragment_text": the `(stripped_text:weight)` form.
+      - "had_trailing_punctuation_originally": flag the stitcher reads.
+      - "stripped_plain_text_no_wrap": the section text with outer
+        punctuation/whitespace stripped, no wrap — used by the
+        reference-prompt display builder.
 
-      Base prompt = comma-join of each section's enhanced_text (when
-      non-empty) or global_text (passthrough fallback). The base prompt
-      MUST contain the rich descriptive text because cutoff's region/
-      target sublist matching needs to find positions for both the
-      region span (the enhanced_text substring) and the target words
-      (enhanced minus global) within the base.
-
-      The section's contribution to the base prompt is wrapped at
-      `(text : global_text_weight × stream_strength)` for both
-      passthrough and true-region sections — `global_text_weight` is
-      now the CLIP-attention weight on this section's slice of the
-      natural base prompt.
-
-    Returns a list of fragment strings (possibly empty if this section
-    is excluded from this stream via stream_strength == 0).
+    Returns a list (length 0 or 1; 0 when this section is excluded from
+    this stream via zero stream strength).
     """
     per_stream_strength_value = _select_per_stream_strength_value_for_section(
         section_descriptor, stream_key_l_or_g
@@ -259,21 +289,34 @@ def _build_per_section_base_prompt_fragment_list_for_one_stream(
         return []
     is_true_region = bool(section_descriptor.get("is_true_region"))
     if is_true_region:
-        text_for_base_prompt_this_section = section_descriptor.get("enhanced_text") or ""
+        raw_text_for_this_section = section_descriptor.get("enhanced_text") or ""
     else:
-        # Passthrough: prefer global_text, fall back to enhanced_text if
-        # somehow only enhanced was filled in.
-        text_for_base_prompt_this_section = (
+        raw_text_for_this_section = (
             section_descriptor.get("global_text") or section_descriptor.get("enhanced_text") or ""
         )
-    if not text_for_base_prompt_this_section:
+    if not raw_text_for_this_section:
+        return []
+    (
+        stripped_text_for_wrap_content,
+        had_leading_comma_in_original_text,
+        had_trailing_comma_in_original_text,
+    ) = _strip_section_outer_punctuation_and_detect_leading_and_trailing_comma_flags(
+        raw_text_for_this_section
+    )
+    if not stripped_text_for_wrap_content:
         return []
     weight_to_apply_to_base_prompt_fragment = (
         float(section_descriptor.get("global_text_weight", 1.0)) * per_stream_strength_value
     )
-    return [
-        f"({text_for_base_prompt_this_section}:{round(weight_to_apply_to_base_prompt_fragment, 4)})"
-    ]
+    wrapped_fragment_text_for_this_section = (
+        f"({stripped_text_for_wrap_content}:{round(weight_to_apply_to_base_prompt_fragment, 4)})"
+    )
+    return [{
+        "wrapped_fragment_text": wrapped_fragment_text_for_this_section,
+        "had_leading_comma_originally": had_leading_comma_in_original_text,
+        "had_trailing_comma_originally": had_trailing_comma_in_original_text,
+        "stripped_plain_text_no_wrap": stripped_text_for_wrap_content,
+    }]
 
 
 
@@ -694,72 +737,127 @@ def _apply_v3_per_text_transforms_to_one_text_string(
 
 
 def _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
-    active_section_descriptors_list, stream_key_l_or_g
+    active_section_descriptors_list, stream_key_l_or_g, join_separator_string=","
 ):
     """
-    Walks the active sections in declaration order, builds each section's
-    base-prompt fragment for this stream (or None if excluded by zero
-    stream-strength), and returns:
-      - the comma-joined base prompt text for this stream
-      - the parallel list `[fragment_or_none_for_section_0, ...]` so
-        callers can correlate per-section identity with positions in
-        the base prompt.
+    5-step section-stitching algorithm:
+
+      1. Per section, get `_build_per_section_base_prompt_fragment_list_for_one_stream`'s
+         record: wrapped_fragment_text, had_leading_comma_originally,
+         had_trailing_comma_originally.
+      2. For each non-empty section, build its emitted form:
+            [leading_comma_if_had_AND_not_first_section]
+            wrapped_fragment_text
+            [trailing_comma_if_had_AND_not_last_section]
+      3. After non-last sections, append `join_separator_string` IF the
+         current accumulated tail does not already end with that exact
+         separator.
+      4. Concatenate.
+
+    Returns (base_prompt_text, per_section_wrapped_fragment_or_none_list)
+    where the second item parallels active_section_descriptors_list so
+    callers can correlate by index.
     """
+    per_section_fragment_records_in_section_order = []
     per_section_base_fragment_or_none_list = []
-    base_prompt_text_parts_for_this_stream = []
     for section_descriptor in active_section_descriptors_list:
         per_section_fragment_list = _build_per_section_base_prompt_fragment_list_for_one_stream(
             section_descriptor, stream_key_l_or_g
         )
-        # First fragment (the global contribution) identifies this section's
-        # natural-prompt anchor for downstream correlation.
-        per_section_base_fragment_or_none_list.append(
-            per_section_fragment_list[0] if per_section_fragment_list else None
-        )
-        # All fragments (global + optional blended-enhanced) enter the base prompt.
-        base_prompt_text_parts_for_this_stream.extend(per_section_fragment_list)
+        if per_section_fragment_list:
+            per_section_fragment_records_in_section_order.append(per_section_fragment_list[0])
+            per_section_base_fragment_or_none_list.append(
+                per_section_fragment_list[0]["wrapped_fragment_text"]
+            )
+        else:
+            per_section_base_fragment_or_none_list.append(None)
+    if not per_section_fragment_records_in_section_order:
+        return ("", per_section_base_fragment_or_none_list)
+    total_emitting_record_count = len(per_section_fragment_records_in_section_order)
+    accumulated_base_prompt_text = ""
+    for one_record_zero_based_index, one_fragment_record in enumerate(
+        per_section_fragment_records_in_section_order
+    ):
+        is_first_emitting_record = (one_record_zero_based_index == 0)
+        is_last_emitting_record = (one_record_zero_based_index == total_emitting_record_count - 1)
+        if (not is_first_emitting_record) and one_fragment_record["had_leading_comma_originally"]:
+            accumulated_base_prompt_text += ","
+        accumulated_base_prompt_text += one_fragment_record["wrapped_fragment_text"]
+        if (not is_last_emitting_record) and one_fragment_record["had_trailing_comma_originally"]:
+            accumulated_base_prompt_text += ","
+        if (not is_last_emitting_record) and join_separator_string:
+            if not accumulated_base_prompt_text.endswith(join_separator_string):
+                accumulated_base_prompt_text += join_separator_string
     return (
-        ", ".join(base_prompt_text_parts_for_this_stream),
+        accumulated_base_prompt_text,
         per_section_base_fragment_or_none_list,
     )
 
 
 def _build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
     active_section_descriptors_list,
+    join_separator_string=",",
 ):
     """
-    Stream-independent display-only reference string. Walks active
-    sections in declaration order and emits each section's natural text
-    (enhanced_text if it's a true region, else global_text) WITHOUT
-    any `(text:weight)` CLIP attention-weight wrapping. This is what
-    the user sees when they connect `reference_full_prompt` to a
-    ShowText node.
+    Stream-independent display-only reference string. Same 5-step
+    stitching algorithm as the base-prompt builder, BUT without the
+    `(text:weight)` wrap — emits the plain section text directly so
+    the user can copy-paste it into any other CLIP encoder.
 
-    Excludes sections whose BOTH per-stream strengths are zero (they
-    contribute to neither stream so they're effectively excluded from
-    the encoding entirely).
+    Excludes sections whose BOTH per-stream strengths are zero.
     """
-    plain_text_parts_in_declaration_order = []
+    plain_text_records_in_section_order = []
     for section_descriptor in active_section_descriptors_list:
         per_section_l_strength = float(section_descriptor.get("clip_l_strength", 1.0))
         per_section_g_strength = float(section_descriptor.get("clip_g_strength", 1.0))
         if per_section_l_strength == 0 and per_section_g_strength == 0:
             continue
         if section_descriptor.get("is_true_region"):
-            plain_text_for_this_section = (
+            raw_text_for_this_section = (
                 section_descriptor.get("enhanced_text")
                 or section_descriptor.get("global_text")
                 or ""
             )
         else:
-            plain_text_for_this_section = (
+            raw_text_for_this_section = (
                 section_descriptor.get("global_text")
                 or section_descriptor.get("enhanced_text")
                 or ""
             )
-        if plain_text_for_this_section.strip():
-            plain_text_parts_in_declaration_order.append(plain_text_for_this_section.strip())
-    return ", ".join(plain_text_parts_in_declaration_order)
+        if not raw_text_for_this_section:
+            continue
+        (
+            stripped_text_no_wrap,
+            had_leading_comma_in_original_text,
+            had_trailing_comma_in_original_text,
+        ) = _strip_section_outer_punctuation_and_detect_leading_and_trailing_comma_flags(
+            raw_text_for_this_section
+        )
+        if not stripped_text_no_wrap:
+            continue
+        plain_text_records_in_section_order.append({
+            "plain_text_no_wrap": stripped_text_no_wrap,
+            "had_leading_comma_originally": had_leading_comma_in_original_text,
+            "had_trailing_comma_originally": had_trailing_comma_in_original_text,
+        })
+    if not plain_text_records_in_section_order:
+        return ""
+    total_emitting_record_count = len(plain_text_records_in_section_order)
+    accumulated_reference_text = ""
+    for one_record_zero_based_index, one_plain_text_record in enumerate(
+        plain_text_records_in_section_order
+    ):
+        is_first_emitting_record = (one_record_zero_based_index == 0)
+        is_last_emitting_record = (one_record_zero_based_index == total_emitting_record_count - 1)
+        if (not is_first_emitting_record) and one_plain_text_record["had_leading_comma_originally"]:
+            accumulated_reference_text += ","
+        accumulated_reference_text += one_plain_text_record["plain_text_no_wrap"]
+        if (not is_last_emitting_record) and one_plain_text_record["had_trailing_comma_originally"]:
+            accumulated_reference_text += ","
+        if (not is_last_emitting_record) and join_separator_string:
+            if not accumulated_reference_text.endswith(join_separator_string):
+                accumulated_reference_text += join_separator_string
+    return accumulated_reference_text
 
 
 def _compute_target_words_as_case_insensitive_set_difference_of_enhanced_minus_global(
@@ -921,6 +1019,7 @@ def _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
     clip_object,
     active_section_descriptors_list,
     stream_key_l_or_g,
+    join_separator_string=",",
 ):
     """
     v3 cutoff-style per-stream encoder. Builds the base prompt, performs
@@ -938,7 +1037,7 @@ def _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
 
     base_prompt_text_for_this_stream, _per_section_fragment_or_none_list = (
         _build_per_stream_base_prompt_text_and_per_section_base_fragment_list(
-            active_section_descriptors_list, stream_key_l_or_g
+            active_section_descriptors_list, stream_key_l_or_g, join_separator_string
         )
     )
 
@@ -1121,6 +1220,7 @@ def _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
 def _encode_active_v3_sections_into_one_sdxl_conditioning_entry(
     clip_object,
     active_section_descriptors_list,
+    join_separator_string=",",
 ):
     """
     Top-level per-streams driver. Encodes L and G independently using
@@ -1129,12 +1229,12 @@ def _encode_active_v3_sections_into_one_sdxl_conditioning_entry(
     """
     final_embedding_tensor_for_l_stream, _l_pooled_unused = (
         _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
-            clip_object, active_section_descriptors_list, "l"
+            clip_object, active_section_descriptors_list, "l", join_separator_string
         )
     )
     final_embedding_tensor_for_g_stream, g_pooled_output_tensor_or_none = (
         _encode_v3_for_one_stream_returning_final_embedding_and_pooled(
-            clip_object, active_section_descriptors_list, "g"
+            clip_object, active_section_descriptors_list, "g", join_separator_string
         )
     )
 
@@ -1223,6 +1323,17 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
                     "known_a1111_embedding_names_to_filter_when_not_installed_locally.txt"
                 ),
             }),
+            "join_separator": ("STRING", {
+                "default": ",",
+                "multiline": False,
+                "tooltip": (
+                    "String inserted between sections in the base prompt when "
+                    "the prior section did not already end with this separator. "
+                    "Default ','. Set empty to insert no separator (sections then "
+                    "concatenate directly, with single commas still preserved "
+                    "from any trailing punctuation the user typed in the section)."
+                ),
+            }),
             # Zoom-effect group (zoom + offset_x + offset_y). A canvas-drawn
             # header label is inserted above these by the dedicated frontend
             # extension web/clip_text_encode_sdxl_v3_global_and_enhanced.js.
@@ -1284,6 +1395,7 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
         support_a1111_style_embedding_text,
         remove_text_for_unsupported_embeddings,
         filter_known_a1111_embedding_tags_not_installed_locally,
+        join_separator,
         zoom,
         offset_x,
         offset_y,
@@ -1379,10 +1491,11 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
             return (primary_empty_conditioning_list, upscaled_empty_conditioning_list, "")
 
         # Encode via v3 cutoff math (single composite entry).
+        join_separator_string_for_this_call = str(join_separator if join_separator is not None else ",")
         try:
             raw_conditioning_entry_from_v3_encoder = (
                 _encode_active_v3_sections_into_one_sdxl_conditioning_entry(
-                    clip, active_section_descriptors_list
+                    clip, active_section_descriptors_list, join_separator_string_for_this_call
                 )
             )
         except Exception as v3_encoding_failure:
@@ -1417,7 +1530,7 @@ class CLIPTextEncodeSDXLV3GlobalAndEnhanced:
         # build for canonical display.
         reference_plain_text_for_user_display = (
             _build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
-                active_section_descriptors_list
+                active_section_descriptors_list, join_separator_string_for_this_call
             )
         )
 

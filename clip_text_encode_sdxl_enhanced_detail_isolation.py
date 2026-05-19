@@ -114,6 +114,16 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolation:
                     "min": UPSCALED_CONDITIONING_MULTIPLIER_MINIMUM_VALUE,
                     "step": 0.01,
                 }),
+                "join_separator": ("STRING", {
+                    "default": ",",
+                    "multiline": False,
+                    "tooltip": (
+                        "String inserted between chained sections in the base prompt "
+                        "when the prior section did not already end with this separator. "
+                        "Default ','. Empty = no separator inserted (sections concatenate "
+                        "directly; single commas still preserved from typed trailing punctuation)."
+                    ),
+                }),
                 "zoom": ("FLOAT", {
                     "default": ZOOM_DEFAULT_VALUE,
                     "min": ZOOM_MINIMUM_VALUE,
@@ -148,6 +158,7 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolation:
         self,
         clip,
         upscaled_conditioning_multiplier,
+        join_separator,
         zoom,
         offset_x,
         offset_y,
@@ -220,11 +231,12 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolation:
             )
             return (primary_empty_conditioning_list, upscaled_empty_conditioning_list, "")
 
+        join_separator_string_for_this_call = str(join_separator if join_separator is not None else ",")
         # v3 cutoff math via the shared encoder.
         try:
             raw_conditioning_entry_from_shared_encoder = (
                 encode_active_v3_sections_into_one_sdxl_conditioning_entry(
-                    clip, section_descriptors_from_chain_list
+                    clip, section_descriptors_from_chain_list, join_separator_string_for_this_call
                 )
             )
         except Exception as encoding_failure_exception_caught:
@@ -251,7 +263,7 @@ class CLIPTextEncodeSDXLEnhancedDetailIsolation:
 
         reference_plain_text_for_user_display = (
             build_plain_text_reference_prompt_without_clip_weight_wrapping_for_display(
-                section_descriptors_from_chain_list
+                section_descriptors_from_chain_list, join_separator_string_for_this_call
             )
         )
 
