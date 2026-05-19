@@ -15,8 +15,9 @@ const INLINE_TAGGED_PROMPT_HEADER_WIDGET_NAME = "__inline_tagged_prompt_header_s
 const INLINE_TAGGED_PROMPT_HEADER_LABEL_LINES_LIST_ABOVE_FIELD = [
   "── inline tag syntax (tags are stripped before encoding) ──",
   "<REGION>...</REGION>  marks a cutoff region (its body becomes part of the natural prompt).",
+  "<REGION time:0.0-1.0>...</REGION>  optional per-region timestep range (default 0.0-1.0).",
   "<DETAIL>words</DETAIL>  inside a REGION marks words masked from OTHER regions' attention.",
-  "Text outside REGION blocks is passthrough (no isolation).",
+  "Text outside REGION blocks is passthrough (no isolation, always active).",
 ];
 
 const ZOOM_GROUP_HEADER_WIDGET_NAME = "__inline_tagged_zoom_group_header_static";

@@ -88,9 +88,45 @@ REGION_BLOCK_WITH_OPTIONAL_ATTRS_REGEX_PATTERN = re.compile(
 )
 # Per-attribute pattern: `key:value` separated by whitespace inside
 # the opening tag's attrs block. value matches up to next whitespace.
+# Compact range form: `time:0.0-1.0` (value is captured as the whole
+# "0.0-1.0" string; the timestep parser splits on '-').
 REGION_ONE_ATTRIBUTE_KEY_VALUE_PAIR_REGEX_PATTERN = re.compile(
     r"(?P<attr_key>\w+)\s*:\s*(?P<attr_value>[\w.+\-]+)"
 )
+
+
+def _parse_compact_time_range_attribute_value_string_into_start_end_floats(
+    raw_compact_time_value_string_or_none,
+):
+    """
+    Parse the compact `time:` attribute value into (start_float, end_float).
+    Format: "X-Y" where X and Y are floats in [0.0, 1.0].
+
+    Accepts:
+        "0.0-1.0"  -> (0.0, 1.0)
+        "0.5-0.9"  -> (0.5, 0.9)
+        "0.2"      -> (0.2, 0.2)   (degenerate; treated as zero-width)
+        None       -> None
+
+    Returns None if parse fails so caller can fall back to defaults
+    (and/or the older `start_timestep:` / `end_timestep:` attrs).
+    """
+    if not raw_compact_time_value_string_or_none:
+        return None
+    split_parts_on_hyphen = raw_compact_time_value_string_or_none.split("-")
+    # Filter empty parts (handles leading/trailing '-' edge cases).
+    non_empty_string_parts = [part for part in split_parts_on_hyphen if part.strip() != ""]
+    if len(non_empty_string_parts) == 0:
+        return None
+    try:
+        start_value_as_float_from_first_part = float(non_empty_string_parts[0])
+        if len(non_empty_string_parts) >= 2:
+            end_value_as_float_from_second_part = float(non_empty_string_parts[1])
+        else:
+            end_value_as_float_from_second_part = start_value_as_float_from_first_part
+    except (TypeError, ValueError):
+        return None
+    return (start_value_as_float_from_first_part, end_value_as_float_from_second_part)
 
 # Capture <DETAIL>...</DETAIL> blocks inside a region body.
 DETAIL_BLOCK_REGEX_PATTERN = re.compile(
@@ -244,14 +280,31 @@ def _parse_inline_tagged_prompt_into_section_descriptors_in_textual_order(
                 attrs_block_text_inside_opening_tag
             )
         )
-        this_region_start_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
-            parsed_region_attribute_dict.get("start_timestep"),
-            DEFAULT_TIMESTEP_RANGE_START_VALUE,
+        # Prefer the compact `time:X-Y` form. Fall back to the verbose
+        # `start_timestep:X end_timestep:Y` form when `time` isn't given.
+        compact_time_range_parsed_or_none = (
+            _parse_compact_time_range_attribute_value_string_into_start_end_floats(
+                parsed_region_attribute_dict.get("time")
+            )
         )
-        this_region_end_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
-            parsed_region_attribute_dict.get("end_timestep"),
-            DEFAULT_TIMESTEP_RANGE_END_VALUE,
-        )
+        if compact_time_range_parsed_or_none is not None:
+            this_region_start_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
+                compact_time_range_parsed_or_none[0],
+                DEFAULT_TIMESTEP_RANGE_START_VALUE,
+            )
+            this_region_end_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
+                compact_time_range_parsed_or_none[1],
+                DEFAULT_TIMESTEP_RANGE_END_VALUE,
+            )
+        else:
+            this_region_start_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
+                parsed_region_attribute_dict.get("start_timestep"),
+                DEFAULT_TIMESTEP_RANGE_START_VALUE,
+            )
+            this_region_end_timestep_value = _parse_one_timestep_attribute_value_to_clamped_float(
+                parsed_region_attribute_dict.get("end_timestep"),
+                DEFAULT_TIMESTEP_RANGE_END_VALUE,
+            )
         # Defensive: ensure start <= end. If user typed them backwards,
         # swap silently.
         if this_region_start_timestep_value > this_region_end_timestep_value:
@@ -331,7 +384,7 @@ INLINE_TAGGED_PROMPT_PLACEHOLDER_HELP_TEXT = (
     # The placeholder stays minimal — just the example — since the
     # syntax docs are visible up there permanently.
     "Example: <REGION>a <DETAIL>gnarled old</DETAIL> tree</REGION>, "
-    "<REGION>a bird <DETAIL>red eyes</DETAIL></REGION>"
+    "<REGION time:0.5-1.0>tree with <DETAIL>peeling bark</DETAIL></REGION>"
 )
 
 
